@@ -2,12 +2,135 @@
 local awful = require("awful")
 local gears = require("gears")
 local wibox = require("wibox")
+local beautiful = require("beautiful")
 local menubar_utils = require("menubar.utils")
+local tray_menu = require("tray-menu")
+local tray_registry = require("tray-registry")
 local c = require("theme.catppuccin")
 
 local M = {}
 
+local systray_widget
+local pill_refreshers = {}
+local last_tray_icons = {}
+local live_icon_cache = {}
+
 local ICON = 22
+
+local function shell_line(cmd)
+    local handle = io.popen(cmd .. " 2>/dev/null")
+    if not handle then
+        return ""
+    end
+    local out = handle:read("*a") or ""
+    handle:close()
+    return out:gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function parse_bus_string(output)
+    if not output or output == "" then
+        return nil
+    end
+    return output:match('^%S+%s+"([^"]+)"') or output:match("^%S+%s+(%S+)")
+end
+
+local function resolve_tray_icon_file(theme_path, icon_name)
+    if not theme_path or theme_path == "" or not icon_name or icon_name == "" then
+        return nil
+    end
+
+    for _, size in ipairs({ ICON, 24, 32, 16, 48 }) do
+        local path = string.format(
+            "%s/hicolor/%dx%d/apps/%s.png",
+            theme_path,
+            size,
+            size,
+            icon_name
+        )
+        local handle = io.open(path, "r")
+        if handle then
+            handle:close()
+            return path
+        end
+    end
+end
+
+local function live_tray_icon(item, force)
+    if not item then
+        return nil
+    end
+
+    if not item.service or not item.sni_path then
+        return item.icon_path
+    end
+
+    local cache_key = item.service .. item.sni_path
+    local icon_name = parse_bus_string(shell_line(string.format(
+        "busctl --user get-property %q %q org.kde.StatusNotifierItem IconName",
+        item.service,
+        item.sni_path
+    )))
+    local theme_path = parse_bus_string(shell_line(string.format(
+        "busctl --user get-property %q %q org.kde.StatusNotifierItem IconThemePath",
+        item.service,
+        item.sni_path
+    )))
+    local icon_key = (icon_name or "") .. "|" .. (theme_path or "")
+    local cached = live_icon_cache[cache_key]
+
+    if not force and cached and cached.icon_key == icon_key then
+        item.icon_name = cached.icon_name
+        item.icon_path = cached.icon_path
+        return cached.icon_path
+    end
+
+    local path = resolve_tray_icon_file(theme_path, icon_name)
+    if path then
+        item.icon_name = icon_name
+        item.icon_path = path
+        live_icon_cache[cache_key] = {
+            icon_key = icon_key,
+            icon_name = icon_name,
+            icon_path = path,
+        }
+        return path
+    end
+
+    return item.icon_path
+end
+
+local function poll_tray_icons()
+    local changed = false
+
+    for _, item in ipairs(tray_registry.list()) do
+        local path = live_tray_icon(item, true)
+        if path and last_tray_icons[item.id] ~= path then
+            last_tray_icons[item.id] = path
+            changed = true
+        end
+    end
+
+    if changed then
+        for _, refresh in pairs(pill_refreshers) do
+            refresh()
+        end
+    end
+
+    return changed
+end
+
+local function ensure_icon_poll_timer()
+    if M._icon_poll_timer then
+        return
+    end
+
+    M._icon_poll_timer = gears.timer {
+        timeout = 4,
+        autostart = true,
+        callback = poll_tray_icons,
+    }
+end
+
 local ITEM = 40
 local LAUNCHER_ICON = 18
 local ITEM_GAP = 8
@@ -35,10 +158,10 @@ local fallback_icons = {
     slack = "󰒱",
     discord = "󰙯",
     telegram = "󰚇",
+    hubstaff = "󰄉",
     ["netsoft-com.netsoft.hubstaff"] = "󰄉",
 }
 
--- Map WM class names to .desktop Icon= names when they differ.
 local icon_aliases = {
     pgadmin4 = "pgadmin4",
     pgadmin = "pgadmin4",
@@ -94,62 +217,8 @@ local function icon_for(cl)
     return fallback_icons[(cl.class or ""):lower()] or "󰖟"
 end
 
--- Tray-style apps that keep running after their window is closed.
-local persistent_apps = {
-    slack = {
-        launch = "slack",
-        quit = "pkill -x slack 2>/dev/null; pkill -f '/usr/bin/slack' 2>/dev/null",
-        pgrep = { "slack" },
-    },
-    viber = {
-        launch = "viber",
-        quit = "pkill -x Viber 2>/dev/null; pkill -f '/usr/bin/viber' 2>/dev/null",
-        pgrep = { "Viber", "viber" },
-    },
-    viberpc = {
-        launch = "viber",
-        quit = "pkill -x Viber 2>/dev/null; pkill -f '/usr/bin/viber' 2>/dev/null",
-        pgrep = { "Viber", "viber" },
-    },
-    telegramdesktop = {
-        launch = "Telegram",
-        quit = "Telegram -quit",
-        pgrep = { "Telegram" },
-    },
-    discord = {
-        launch = "discord",
-        quit = "pkill -x Discord 2>/dev/null; pkill -f '/usr/bin/discord' 2>/dev/null",
-        pgrep = { "Discord", "discord" },
-    },
-    spotify = {
-        launch = "spotify",
-        quit = "pkill -x spotify 2>/dev/null",
-        pgrep = { "spotify" },
-    },
-}
-
-local function persistent_key(cl)
-    return persistent_apps[(cl.class or ""):lower()] and (cl.class or ""):lower() or nil
-end
-
-local function process_running(key)
-    local conf = persistent_apps[key]
-    if not conf then
-        return false
-    end
-
-    for _, name in ipairs(conf.pgrep or {}) do
-        local handle = io.popen("pgrep -x " .. name .. " 2>/dev/null | head -1")
-        if handle then
-            local pid = handle:read("*l")
-            handle:close()
-            if pid and pid ~= "" then
-                return true
-            end
-        end
-    end
-
-    return false
+local function is_tray_app(cl)
+    return tray_registry.match_client(cl) ~= nil
 end
 
 local skip = {
@@ -174,7 +243,102 @@ local function include_client(cl)
     if cl.name and cl.name:lower():find("polybar", 1, true) then
         return false
     end
+    if is_tray_app(cl) then
+        return false
+    end
     return true
+end
+
+local function ensure_systray(s)
+    if not systray_widget then
+        beautiful.bg_systray = "#00000000"
+        systray_widget = wibox.widget.systray()
+        systray_widget:set_horizontal(true)
+        systray_widget:set_base_size(ICON)
+
+        if not M._systray_connected then
+            awesome.connect_signal("systray::update", function()
+                if not M._systray_refresh_pending then
+                    M._systray_refresh_pending = true
+                    gears.timer.start_new(0.3, function()
+                        M._systray_refresh_pending = false
+                        poll_tray_icons()
+                        for _, refresh in pairs(pill_refreshers) do
+                            refresh()
+                        end
+                    end)
+                end
+            end)
+            M._systray_connected = true
+        end
+    end
+
+    systray_widget:set_screen(s)
+    return systray_widget
+end
+
+function M.prepare_tray_menu(item, x, y)
+    if not M._tray_host or not item then
+        return
+    end
+
+    local index = tray_registry.systray_index(item)
+
+    if not M._tray_restore_geo then
+        M._tray_restore_geo = {
+            x = M._tray_host.x,
+            y = M._tray_host.y,
+            width = M._tray_host.width,
+            height = M._tray_host.height,
+            ontop = M._tray_host.ontop,
+        }
+    end
+
+    M._tray_host.ontop = true
+    M._tray_host:geometry {
+        x = math.floor(x - index * (ICON + 4) - ICON / 2),
+        y = math.floor(y - ITEM / 2),
+        width = math.max((ICON + 4) * math.max(awesome.systray(), 1), 200),
+        height = ITEM,
+    }
+
+    if M._tray_host.raise then
+        M._tray_host:raise()
+    end
+end
+
+function M.restore_tray_host()
+    if M._tray_host and M._tray_restore_geo then
+        M._tray_host.ontop = M._tray_restore_geo.ontop
+        M._tray_host:geometry {
+            x = M._tray_restore_geo.x,
+            y = M._tray_restore_geo.y,
+            width = M._tray_restore_geo.width,
+            height = M._tray_restore_geo.height,
+        }
+        M._tray_restore_geo = nil
+    end
+end
+
+local function ensure_hidden_tray_host(s)
+    if M._tray_host or s ~= screen.primary then
+        return
+    end
+
+    local tray = ensure_systray(s)
+    M._tray_host = wibox {
+        screen = s,
+        name = "awesome-tray-host",
+        visible = true,
+        opacity = 0,
+        type = "utility",
+        ontop = false,
+        border_width = 0,
+        bg = "#00000000",
+        width = 480,
+        height = ITEM,
+        widget = tray,
+    }
 end
 
 local function launcher(icon, cmd, tip)
@@ -216,6 +380,44 @@ local function pill_shape(cr, w, h)
     gears.shape.partially_rounded_rect(cr, w, h, true, true, false, false, RADIUS)
 end
 
+local function build_icon_widget(theme_icon, nerd_icon, cl)
+    if theme_icon then
+        local surface = gears.surface.load(theme_icon, false)
+        return wibox.widget {
+            image = surface or theme_icon,
+            forced_width = ICON,
+            forced_height = ICON,
+            resize = true,
+            widget = wibox.widget.imagebox,
+        }
+    end
+
+    if cl and client_has_wm_icon(cl) then
+        local widget = wibox.widget {
+            forced_width = ICON,
+            forced_height = ICON,
+            widget = awful.widget.clienticon,
+        }
+        widget.client = cl
+        return widget
+    end
+
+    return wibox.widget {
+        {
+            markup = string.format(
+                '<span font="JetBrainsMono Nerd Font %d" foreground="%s">%s</span>',
+                ICON, c.text, nerd_icon or "󰖟"
+            ),
+            align = "center",
+            valign = "center",
+            widget = wibox.widget.textbox,
+        },
+        forced_width = ICON,
+        forced_height = ICON,
+        widget = wibox.container.place,
+    }
+end
+
 function M.create(s)
     local open_apps = wibox.widget {
         spacing = ITEM_GAP,
@@ -223,205 +425,57 @@ function M.create(s)
     }
 
     local tracked = {}
+    local highlight_widgets = {}
     local place
+    local layout_pill
+    local refresh_debounce
+
+    local function update_focus_highlights()
+        for _, entry in ipairs(highlight_widgets) do
+            if entry.widget and entry.get_color then
+                entry.widget.bg = entry.get_color()
+            end
+        end
+    end
 
     local function schedule_refresh()
-        if place then
-            gears.timer.delayed_call(place)
-        end
-    end
-
-    local function remember_client(cl)
-        local key = persistent_key(cl)
-        if not key then
+        if refresh_debounce then
+            refresh_debounce:again()
             return
         end
-
-        local entry = tracked[key] or {
-            pids = {},
-        }
-
-        entry.name = cl.name or cl.class
-        entry.theme_icon = lookup_app_icon(cl) or entry.theme_icon
-        entry.nerd_icon = icon_for(cl)
-        if cl.pid then
-            entry.pids[cl.pid] = true
-        end
-
-        tracked[key] = entry
-    end
-
-    local function drop_tracked(key)
-        tracked[key] = nil
-    end
-
-    local function build_icon(theme_icon, nerd_icon, cl)
-        if theme_icon then
-            return wibox.widget {
-                image = theme_icon,
-                forced_width = ICON,
-                forced_height = ICON,
-                resize = true,
-                widget = wibox.widget.imagebox,
-            }
-        end
-
-        if cl and client_has_wm_icon(cl) then
-            local widget = wibox.widget {
-                forced_width = ICON,
-                forced_height = ICON,
-                widget = awful.widget.clienticon,
-            }
-            widget.client = cl
-            return widget
-        end
-
-        return wibox.widget {
-            {
-                markup = string.format(
-                    '<span font="JetBrainsMono Nerd Font %d" foreground="%s">%s</span>',
-                    ICON, c.text, nerd_icon or "󰖟"
-                ),
-                align = "center",
-                valign = "center",
-                widget = wibox.widget.textbox,
-            },
-            forced_width = ICON,
-            forced_height = ICON,
-            widget = wibox.container.place,
-        }
-    end
-
-    local function show_persistent_menu(key, cl)
-        local conf = persistent_apps[key]
-        local entry = tracked[key]
-        if not conf or not entry then
-            return
-        end
-
-        local items = {}
-
-        if not cl or not cl.valid then
-            items[#items + 1] = {
-                "Open",
-                function()
-                    awful.spawn(conf.launch)
-                    schedule_refresh()
-                end,
-            }
-        end
-
-        items[#items + 1] = {
-            "Quit completely",
-            function()
-                awful.spawn.with_shell(conf.quit)
-                drop_tracked(key)
-                schedule_refresh()
-            end,
-        }
-
-        awful.menu({
-            theme = { width = 220 },
-            items = items,
-        }):show()
-    end
-
-    local function make_persistent_item(key, cl)
-        local conf = persistent_apps[key]
-        local entry = tracked[key]
-        if not conf or not entry then
-            return nil
-        end
-
-        local has_window = cl and cl.valid
-        local icon = build_icon(entry.theme_icon, entry.nerd_icon, cl)
-        local bg_color = c.mantle
-
-        if has_window then
-            bg_color = (cl == client.focus) and c.mauve or c.surface1
-        end
-
-        local bg = wibox.widget {
-            {
-                icon,
-                left = 8,
-                right = 8,
-                top = 5,
-                bottom = 5,
-                widget = wibox.container.margin,
-            },
-            forced_width = ITEM,
-            forced_height = ITEM,
-            bg = bg_color,
-            shape = function(cr, w, h)
-                gears.shape.rounded_rect(cr, w, h, 8)
-            end,
-            widget = wibox.container.background,
-        }
-
-        bg:buttons(gears.table.join(
-            awful.button({}, 1, function()
-                if has_window then
-                    if cl == client.focus and not cl.minimized then
-                        cl.minimized = true
-                    else
-                        cl.minimized = false
-                        awful.client.jumpto(cl)
-                    end
-                else
-                    awful.spawn(conf.launch)
+        refresh_debounce = gears.timer {
+            timeout = 0.08,
+            autostart = true,
+            single_shot = true,
+            callback = function()
+                refresh_debounce = nil
+                if place then
+                    place()
                 end
-            end),
-            awful.button({}, 3, function()
-                show_persistent_menu(key, cl)
-            end)
-        ))
-
-        awful.tooltip {
-            objects = { bg },
-            timer_delay = 0.2,
-            text = entry.name or (cl and (cl.name or cl.class)) or key,
+            end,
         }
+    end
 
-        return bg
+    local function schedule_layout()
+        if layout_pill then
+            gears.timer.delayed_call(layout_pill)
+        end
+    end
+
+    pill_refreshers[s.index] = schedule_refresh
+    ensure_hidden_tray_host(s)
+
+    local function remember_tray_client(cl, item)
+        local entry = tracked[item.id] or {}
+        entry.name = cl.name or item.title
+        entry.theme_icon = item.icon_path or lookup_app_icon(cl) or entry.theme_icon
+        entry.nerd_icon = icon_for(cl)
+        entry.item = item
+        tracked[item.id] = entry
     end
 
     local function make_client_item(cl)
-        local icon
-        local theme_icon = lookup_app_icon(cl)
-
-        if theme_icon then
-            icon = wibox.widget {
-                image = theme_icon,
-                forced_width = ICON,
-                forced_height = ICON,
-                resize = true,
-                widget = wibox.widget.imagebox,
-            }
-        elseif client_has_wm_icon(cl) then
-            icon = wibox.widget {
-                forced_width = ICON,
-                forced_height = ICON,
-                widget = awful.widget.clienticon,
-            }
-            icon.client = cl
-        else
-            icon = wibox.widget {
-                {
-                    markup = string.format(
-                        '<span font="JetBrainsMono Nerd Font %d" foreground="%s">%s</span>',
-                        ICON, c.text, icon_for(cl)
-                    ),
-                    align = "center",
-                    valign = "center",
-                    widget = wibox.widget.textbox,
-                },
-                forced_width = ICON,
-                forced_height = ICON,
-                widget = wibox.container.place,
-            }
-        end
-
+        local icon = build_icon_widget(lookup_app_icon(cl), icon_for(cl), cl)
         local bg = wibox.widget {
             {
                 icon,
@@ -453,9 +507,22 @@ function M.create(s)
                 end
             end),
             awful.button({}, 3, function()
+                local tray_item = tray_registry.match_client(cl)
+                if tray_item then
+                    local coords = mouse.coords()
+                    tray_menu.show(tray_item, cl, coords.x, coords.y)
+                    return
+                end
                 awful.menu.client_list { theme = { width = 260 } }
             end)
         ))
+
+        highlight_widgets[#highlight_widgets + 1] = {
+            widget = bg,
+            get_color = function()
+                return (cl == client.focus) and c.mauve or c.surface1
+            end,
+        }
 
         awful.tooltip {
             objects = { bg },
@@ -466,40 +533,137 @@ function M.create(s)
         return bg
     end
 
+    local function make_tray_item(item, cl)
+        local entry = tracked[item.id] or {
+            name = item.title,
+            theme_icon = item.icon_path,
+            nerd_icon = (cl and icon_for(cl))
+                or fallback_icons[(item.id_prop or item.id or ""):lower():match("^(%w+)")]
+                or "󰖟",
+            item = item,
+        }
+
+        entry.name = item.title or entry.name
+        entry.theme_icon = item.icon_path or entry.theme_icon
+        entry.item = item
+        tracked[item.id] = entry
+
+        local has_window = cl and cl.valid
+        local icon = build_icon_widget(
+            entry.theme_icon,
+            entry.nerd_icon,
+            entry.theme_icon and nil or cl
+        )
+        local bg_color = has_window and ((cl == client.focus) and c.mauve or c.surface1) or c.mantle
+
+        local bg = wibox.widget {
+            {
+                icon,
+                left = 8,
+                right = 8,
+                top = 5,
+                bottom = 5,
+                widget = wibox.container.margin,
+            },
+            forced_width = ITEM,
+            forced_height = ITEM,
+            bg = bg_color,
+            shape = function(cr, w, h)
+                gears.shape.rounded_rect(cr, w, h, 8)
+            end,
+            widget = wibox.container.background,
+        }
+
+        bg:buttons(gears.table.join(
+            awful.button({}, 1, function()
+                if has_window then
+                    if cl == client.focus and not cl.minimized then
+                        cl.minimized = true
+                    else
+                        cl.minimized = false
+                        awful.client.jumpto(cl)
+                    end
+                else
+                    awful.spawn(item.launch)
+                end
+            end),
+            awful.button({}, 3, function()
+                local coords = mouse.coords()
+                tray_menu.show(entry.item or item, cl, coords.x, coords.y)
+            end)
+        ))
+
+        highlight_widgets[#highlight_widgets + 1] = {
+            widget = bg,
+            get_color = function()
+                if not has_window then
+                    return c.mantle
+                end
+                return (cl == client.focus) and c.mauve or c.surface1
+            end,
+        }
+
+        awful.tooltip {
+            objects = { bg },
+            timer_delay = 0.2,
+            text = entry.name or item.title or item.id,
+        }
+
+        return bg
+    end
+
     local function refresh_apps()
         local items = {}
-        local persistent_with_window = {}
+        local tray_with_window = {}
+        highlight_widgets = {}
 
-        for _, cl in ipairs(client.get()) do
+        local tray_items = tray_registry.list()
+        tray_registry.set_match_items(tray_items)
+
+        local clients = client.get()
+        for _, cl in ipairs(clients) do
             if include_client(cl) then
-                local key = persistent_key(cl)
-                if key then
-                    remember_client(cl)
-                    persistent_with_window[key] = cl
-                    local widget = make_persistent_item(key, cl)
-                    if widget then
-                        items[#items + 1] = widget
-                    end
-                else
-                    items[#items + 1] = make_client_item(cl)
+                items[#items + 1] = make_client_item(cl)
+            end
+        end
+
+        for _, cl in ipairs(clients) do
+            local item = tray_registry.match_client(cl)
+            if item then
+                remember_tray_client(cl, item)
+                tray_with_window[item.id] = cl
+                local widget = make_tray_item(item, cl)
+                if widget then
+                    items[#items + 1] = widget
                 end
             end
         end
 
-        for key in pairs(tracked) do
-            if not persistent_with_window[key] then
-                if process_running(key) then
-                    local widget = make_persistent_item(key, nil)
-                    if widget then
-                        items[#items + 1] = widget
-                    end
-                else
-                    drop_tracked(key)
+        for _, item in ipairs(tray_items) do
+            if not tray_with_window[item.id] and tray_registry.is_running(item) then
+                tracked[item.id] = tracked[item.id] or {
+                    nerd_icon = fallback_icons[item.id]
+                        or fallback_icons[(item.id_prop or ""):lower():match("^(%w+)")]
+                        or "󰖟",
+                }
+                tracked[item.id].name = item.title
+                tracked[item.id].theme_icon = item.icon_path
+                tracked[item.id].item = item
+                if item.icon_path then
+                    last_tray_icons[item.id] = item.icon_path
                 end
+                local widget = make_tray_item(item, nil)
+                if widget then
+                    items[#items + 1] = widget
+                end
+            elseif not tray_registry.is_running(item) then
+                tracked[item.id] = nil
             end
         end
 
+        tray_registry.set_match_items(nil)
         open_apps:set_children(items)
+        update_focus_highlights()
     end
 
     local launchers = wibox.widget {
@@ -544,6 +708,10 @@ function M.create(s)
 
     place = function()
         refresh_apps()
+        layout_pill()
+    end
+
+    layout_pill = function()
         local geo = s.geometry
         local w = select(1, pill:fit(s, geo.width, geo.height)) or 220
         w = math.max(PILL_MIN_W, math.ceil(w))
@@ -558,35 +726,47 @@ function M.create(s)
             width = w,
             height = h,
         }
+
+        if M._tray_host and s == screen.primary then
+            M._tray_host:geometry {
+                x = geo.x - 600,
+                y = y,
+                width = 480,
+                height = ITEM,
+            }
+        end
     end
 
     place()
 
-    gears.timer {
-        timeout = 5,
-        autostart = true,
-        callback = function()
-            if next(tracked) then
-                place()
-            end
-        end,
-    }
+    ensure_icon_poll_timer()
 
-    local function on_client_change()
+    if not M._tray_timer then
+        M._tray_timer = gears.timer {
+            timeout = 30,
+            autostart = true,
+            callback = function()
+                if poll_tray_icons() then
+                    for _, refresh in pairs(pill_refreshers) do
+                        refresh()
+                    end
+                end
+            end,
+        }
+    end
+
+    local function on_client_list_change()
         schedule_refresh()
     end
 
-    s:connect_signal("property::workarea", place)
-    s:connect_signal("property::geometry", place)
-    client.connect_signal("manage", on_client_change)
-    client.connect_signal("unmanage", on_client_change)
-    client.connect_signal("focus", on_client_change)
-    client.connect_signal("property::minimized", on_client_change)
-    client.connect_signal("property::hidden", on_client_change)
-    client.connect_signal("property::class", on_client_change)
-    client.connect_signal("property::icon", on_client_change)
-    client.connect_signal("tagged", on_client_change)
-    client.connect_signal("untagged", on_client_change)
+    s:connect_signal("property::workarea", schedule_layout)
+    s:connect_signal("property::geometry", schedule_layout)
+    client.connect_signal("manage", on_client_list_change)
+    client.connect_signal("unmanage", on_client_list_change)
+    client.connect_signal("focus", update_focus_highlights)
+    client.connect_signal("property::minimized", on_client_list_change)
+    client.connect_signal("property::class", on_client_list_change)
+    client.connect_signal("property::icon", on_client_list_change)
 end
 
 return M

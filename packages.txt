@@ -37,6 +37,8 @@ arandr
 gpick
 python
 rofi-calc
+snixembed
+xdotool
 
 # Optional apps (not installed by default)
 # google-chrome

@@ -90,7 +90,8 @@ theme.notification_icon_size = 48
 theme.notification_margin = 12
 theme.notification_spacing = 8
 
-theme.systray_icon_spacing = 8
+theme.systray_icon_spacing = 4
+theme.bg_systray = "#00000000"
 
 theme.wibar_bg = c.mantle
 theme.wibar_fg = c.text

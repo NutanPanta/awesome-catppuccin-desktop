@@ -256,6 +256,17 @@ awful.rules.rules = {
         },
         properties = { floating = true, placement = awful.placement.centered }
     },
+    {
+        rule_any = {
+            type = { "popup_menu", "dropdown_menu", "menu", "tooltip" },
+        },
+        properties = {
+            ontop = true,
+            focus = true,
+            raise = true,
+            border_width = 0,
+        },
+    },
 }
 
 client.connect_signal("manage", function(c)
@@ -263,6 +274,11 @@ client.connect_signal("manage", function(c)
     if c.class == "Plank" then
         c:kill()
         return
+    end
+
+    if c.type == "popup_menu" or c.type == "dropdown_menu" or c.type == "menu" then
+        c.ontop = true
+        c:raise()
     end
 
     if awesome.startup and not c.size_hints.user_position and not c.size_hints.program_position then

@@ -30,6 +30,14 @@ fi
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
 
+# Bridge modern StatusNotifier tray icons into Awesome's XEmbed systray.
+if command -v snixembed &>/dev/null; then
+    pkill -u "$USER" -x snixembed 2>/dev/null || true
+    GDK_BACKEND=x11 snixembed --fork
+else
+    command -v dunstify &>/dev/null && dunstify "Desktop" "Install snixembed for tray app menus: sudo pacman -S snixembed"
+fi
+
 if command -v systemctl &>/dev/null; then
     systemctl --user enable pipewire pipewire-pulse wireplumber 2>/dev/null || true
     systemctl --user start pipewire pipewire-pulse wireplumber 2>/dev/null || true
