@@ -94,6 +94,64 @@ local function icon_for(cl)
     return fallback_icons[(cl.class or ""):lower()] or "󰖟"
 end
 
+-- Tray-style apps that keep running after their window is closed.
+local persistent_apps = {
+    slack = {
+        launch = "slack",
+        quit = "pkill -x slack 2>/dev/null; pkill -f '/usr/bin/slack' 2>/dev/null",
+        pgrep = { "slack" },
+    },
+    viber = {
+        launch = "viber",
+        quit = "pkill -x Viber 2>/dev/null; pkill -f '/usr/bin/viber' 2>/dev/null",
+        pgrep = { "Viber", "viber" },
+    },
+    viberpc = {
+        launch = "viber",
+        quit = "pkill -x Viber 2>/dev/null; pkill -f '/usr/bin/viber' 2>/dev/null",
+        pgrep = { "Viber", "viber" },
+    },
+    telegramdesktop = {
+        launch = "Telegram",
+        quit = "Telegram -quit",
+        pgrep = { "Telegram" },
+    },
+    discord = {
+        launch = "discord",
+        quit = "pkill -x Discord 2>/dev/null; pkill -f '/usr/bin/discord' 2>/dev/null",
+        pgrep = { "Discord", "discord" },
+    },
+    spotify = {
+        launch = "spotify",
+        quit = "pkill -x spotify 2>/dev/null",
+        pgrep = { "spotify" },
+    },
+}
+
+local function persistent_key(cl)
+    return persistent_apps[(cl.class or ""):lower()] and (cl.class or ""):lower() or nil
+end
+
+local function process_running(key)
+    local conf = persistent_apps[key]
+    if not conf then
+        return false
+    end
+
+    for _, name in ipairs(conf.pgrep or {}) do
+        local handle = io.popen("pgrep -x " .. name .. " 2>/dev/null | head -1")
+        if handle then
+            local pid = handle:read("*l")
+            handle:close()
+            if pid and pid ~= "" then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
 local skip = {
     plank = true,
     polybar = true,
@@ -163,6 +221,170 @@ function M.create(s)
         spacing = ITEM_GAP,
         layout = wibox.layout.fixed.horizontal,
     }
+
+    local tracked = {}
+    local place
+
+    local function schedule_refresh()
+        if place then
+            gears.timer.delayed_call(place)
+        end
+    end
+
+    local function remember_client(cl)
+        local key = persistent_key(cl)
+        if not key then
+            return
+        end
+
+        local entry = tracked[key] or {
+            pids = {},
+        }
+
+        entry.name = cl.name or cl.class
+        entry.theme_icon = lookup_app_icon(cl) or entry.theme_icon
+        entry.nerd_icon = icon_for(cl)
+        if cl.pid then
+            entry.pids[cl.pid] = true
+        end
+
+        tracked[key] = entry
+    end
+
+    local function drop_tracked(key)
+        tracked[key] = nil
+    end
+
+    local function build_icon(theme_icon, nerd_icon, cl)
+        if theme_icon then
+            return wibox.widget {
+                image = theme_icon,
+                forced_width = ICON,
+                forced_height = ICON,
+                resize = true,
+                widget = wibox.widget.imagebox,
+            }
+        end
+
+        if cl and client_has_wm_icon(cl) then
+            local widget = wibox.widget {
+                forced_width = ICON,
+                forced_height = ICON,
+                widget = awful.widget.clienticon,
+            }
+            widget.client = cl
+            return widget
+        end
+
+        return wibox.widget {
+            {
+                markup = string.format(
+                    '<span font="JetBrainsMono Nerd Font %d" foreground="%s">%s</span>',
+                    ICON, c.text, nerd_icon or "󰖟"
+                ),
+                align = "center",
+                valign = "center",
+                widget = wibox.widget.textbox,
+            },
+            forced_width = ICON,
+            forced_height = ICON,
+            widget = wibox.container.place,
+        }
+    end
+
+    local function show_persistent_menu(key, cl)
+        local conf = persistent_apps[key]
+        local entry = tracked[key]
+        if not conf or not entry then
+            return
+        end
+
+        local items = {}
+
+        if not cl or not cl.valid then
+            items[#items + 1] = {
+                "Open",
+                function()
+                    awful.spawn(conf.launch)
+                    schedule_refresh()
+                end,
+            }
+        end
+
+        items[#items + 1] = {
+            "Quit completely",
+            function()
+                awful.spawn.with_shell(conf.quit)
+                drop_tracked(key)
+                schedule_refresh()
+            end,
+        }
+
+        awful.menu({
+            theme = { width = 220 },
+            items = items,
+        }):show()
+    end
+
+    local function make_persistent_item(key, cl)
+        local conf = persistent_apps[key]
+        local entry = tracked[key]
+        if not conf or not entry then
+            return nil
+        end
+
+        local has_window = cl and cl.valid
+        local icon = build_icon(entry.theme_icon, entry.nerd_icon, cl)
+        local bg_color = c.mantle
+
+        if has_window then
+            bg_color = (cl == client.focus) and c.mauve or c.surface1
+        end
+
+        local bg = wibox.widget {
+            {
+                icon,
+                left = 8,
+                right = 8,
+                top = 5,
+                bottom = 5,
+                widget = wibox.container.margin,
+            },
+            forced_width = ITEM,
+            forced_height = ITEM,
+            bg = bg_color,
+            shape = function(cr, w, h)
+                gears.shape.rounded_rect(cr, w, h, 8)
+            end,
+            widget = wibox.container.background,
+        }
+
+        bg:buttons(gears.table.join(
+            awful.button({}, 1, function()
+                if has_window then
+                    if cl == client.focus and not cl.minimized then
+                        cl.minimized = true
+                    else
+                        cl.minimized = false
+                        awful.client.jumpto(cl)
+                    end
+                else
+                    awful.spawn(conf.launch)
+                end
+            end),
+            awful.button({}, 3, function()
+                show_persistent_menu(key, cl)
+            end)
+        ))
+
+        awful.tooltip {
+            objects = { bg },
+            timer_delay = 0.2,
+            text = entry.name or (cl and (cl.name or cl.class)) or key,
+        }
+
+        return bg
+    end
 
     local function make_client_item(cl)
         local icon
@@ -246,11 +468,37 @@ function M.create(s)
 
     local function refresh_apps()
         local items = {}
+        local persistent_with_window = {}
+
         for _, cl in ipairs(client.get()) do
             if include_client(cl) then
-                items[#items + 1] = make_client_item(cl)
+                local key = persistent_key(cl)
+                if key then
+                    remember_client(cl)
+                    persistent_with_window[key] = cl
+                    local widget = make_persistent_item(key, cl)
+                    if widget then
+                        items[#items + 1] = widget
+                    end
+                else
+                    items[#items + 1] = make_client_item(cl)
+                end
             end
         end
+
+        for key in pairs(tracked) do
+            if not persistent_with_window[key] then
+                if process_running(key) then
+                    local widget = make_persistent_item(key, nil)
+                    if widget then
+                        items[#items + 1] = widget
+                    end
+                else
+                    drop_tracked(key)
+                end
+            end
+        end
+
         open_apps:set_children(items)
     end
 
@@ -294,7 +542,7 @@ function M.create(s)
 
     s.pill_bar:struts { left = 0, right = 0, top = 0, bottom = 0 }
 
-    local function place()
+    place = function()
         refresh_apps()
         local geo = s.geometry
         local w = select(1, pill:fit(s, geo.width, geo.height)) or 220
@@ -314,8 +562,18 @@ function M.create(s)
 
     place()
 
+    gears.timer {
+        timeout = 5,
+        autostart = true,
+        callback = function()
+            if next(tracked) then
+                place()
+            end
+        end,
+    }
+
     local function on_client_change()
-        gears.timer.delayed_call(place)
+        schedule_refresh()
     end
 
     s:connect_signal("property::workarea", place)
