@@ -4,16 +4,14 @@ notify() {
     command -v dunstify &>/dev/null && dunstify "$1" "$2"
 }
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${script_dir}/bluetooth-ensure.sh"
+
 rofi_config="$HOME/.config/rofi/config.rasi"
 
-if ! bluetoothctl show &>/dev/null; then
-    notify "Bluetooth" "Bluetooth service unavailable."
+if ! ensure_bluetooth; then
     exit 1
-fi
-
-if ! bluetoothctl show | grep -q "Powered: yes"; then
-    bluetoothctl power on
-    sleep 1
 fi
 
 declare -A device_macs=()
