@@ -16,16 +16,10 @@ Inspired by [Catppuccin on Arch (Reddit)](https://www.reddit.com/r/linux4noobs/c
 ## Quick start
 
 ```bash
-git clone https://github.com/YOUR_USER/awesome-catppuccin-desktop.git
+git clone https://github.com/NutanPanta/awesome-catppuccin-desktop.git
 cd awesome-catppuccin-desktop
 chmod +x install.sh
 ./install.sh
-```
-
-Optional GTK theme (recommended):
-
-```bash
-yay -S catppuccin-gtk-theme-mocha
 ```
 
 Log out and back in, then choose **Awesome** at the login screen.
@@ -94,7 +88,6 @@ Log out and back in, then choose **Awesome** at the login screen.
 
 - Arch Linux (or Arch-based with `pacman`)
 - Awesome WM session (display manager or `~/.xinitrc`)
-- Optional: `yay` for Catppuccin GTK theme from AUR
 
 ## License
 

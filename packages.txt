@@ -37,7 +37,6 @@ arandr
 gpick
 python
 
-# Optional (install manually with yay if you use them)
-# catppuccin-gtk-theme-mocha
+# Optional apps (not installed by default)
 # google-chrome
 # nvim

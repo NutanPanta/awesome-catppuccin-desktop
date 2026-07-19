@@ -41,7 +41,6 @@ Awesome WM + Catppuccin desktop installer
 After install:
   1. Log out and back in (or reboot) if you were added to new groups
   2. Select Awesome from your display manager, or: echo exec awesome > ~/.xinitrc
-  3. Optional GTK theme: yay -S catppuccin-gtk-theme-mocha
 EOF
 }
 
@@ -93,15 +92,6 @@ install_packages() {
 
     log "Installing ${#pkgs[@]} pacman packages..."
     run sudo pacman -S --needed --noconfirm "${pkgs[@]}"
-}
-
-install_gtk_theme_hint() {
-    if pacman -Q catppuccin-gtk-theme-mocha &>/dev/null; then
-        log "Catppuccin GTK theme already installed."
-        return 0
-    fi
-    warn "Catppuccin GTK theme not installed."
-    warn "For matching app chrome, run: yay -S catppuccin-gtk-theme-mocha"
 }
 
 backup_path() {
@@ -195,10 +185,9 @@ ${BLUE}Included:${NC}
   • GTK 3/4 theme hints, PipeWire audio profile, wallpapers via feh
 
 ${BLUE}Next steps:${NC}
-  1. Optional: yay -S catppuccin-gtk-theme-mocha
-  2. Log out and log back in (or reboot)
-  3. Choose Awesome at the login screen
-  4. If audio is silent: bash ~/.config/awesome/fix-audio.sh
+  1. Log out and log back in (or reboot)
+  2. Choose Awesome at the login screen
+  3. If audio is silent: bash ~/.config/awesome/fix-audio.sh
 
 ${BLUE}Keybindings (defaults):${NC}
   Super+Enter     kitty
@@ -221,8 +210,6 @@ main() {
     else
         log "Skipping package install (--config-only)."
     fi
-
-    install_gtk_theme_hint
 
     log "Deploying configs (existing files backed up first)..."
     deploy_tree "awesome"
