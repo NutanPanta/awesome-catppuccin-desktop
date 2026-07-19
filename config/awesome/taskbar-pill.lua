@@ -2,6 +2,7 @@
 local awful = require("awful")
 local gears = require("gears")
 local wibox = require("wibox")
+local menubar_utils = require("menubar.utils")
 local c = require("theme.catppuccin")
 
 local M = {}
@@ -36,6 +37,58 @@ local fallback_icons = {
     telegram = "󰚇",
     ["netsoft-com.netsoft.hubstaff"] = "󰄉",
 }
+
+-- Map WM class names to .desktop Icon= names when they differ.
+local icon_aliases = {
+    pgadmin4 = "pgadmin4",
+    pgadmin = "pgadmin4",
+    ["pgadmin-4"] = "pgadmin4",
+    viber = "viber",
+    viberpc = "viber",
+}
+
+local function client_icon_candidates(cl)
+    local candidates = {}
+    local seen = {}
+
+    local function add(name)
+        if not name or name == "" then
+            return
+        end
+        name = name:lower()
+        if seen[name] then
+            return
+        end
+        seen[name] = true
+        candidates[#candidates + 1] = name
+    end
+
+    local cls = (cl.class or ""):lower()
+    add(icon_aliases[cls])
+    add(cls)
+    add(cl.instance and cl.instance:lower())
+    if cl.startup_id then
+        add(cl.startup_id:match("^([^_]+)"))
+    end
+    if cl.name then
+        add(cl.name:lower():gsub("%s+", "-"))
+    end
+
+    return candidates
+end
+
+local function lookup_app_icon(cl)
+    for _, name in ipairs(client_icon_candidates(cl)) do
+        local path = menubar_utils.lookup_icon_uncached(name)
+        if path and path ~= false then
+            return path
+        end
+    end
+end
+
+local function client_has_wm_icon(cl)
+    return cl.icon_sizes and #cl.icon_sizes > 0
+end
 
 local function icon_for(cl)
     return fallback_icons[(cl.class or ""):lower()] or "󰖟"
@@ -113,7 +166,17 @@ function M.create(s)
 
     local function make_client_item(cl)
         local icon
-        if cl.icon then
+        local theme_icon = lookup_app_icon(cl)
+
+        if theme_icon then
+            icon = wibox.widget {
+                image = theme_icon,
+                forced_width = ICON,
+                forced_height = ICON,
+                resize = true,
+                widget = wibox.widget.imagebox,
+            }
+        elseif client_has_wm_icon(cl) then
             icon = wibox.widget {
                 forced_width = ICON,
                 forced_height = ICON,
@@ -157,10 +220,14 @@ function M.create(s)
 
         bg:buttons(gears.table.join(
             awful.button({}, 1, function()
-                if cl == client.focus then
+                if not cl.valid then
+                    return
+                end
+                if cl == client.focus and not cl.minimized then
                     cl.minimized = true
                 else
-                    cl:emit_signal("request::activate", "tasklist", { raise = true })
+                    cl.minimized = false
+                    awful.client.jumpto(cl)
                 end
             end),
             awful.button({}, 3, function()
