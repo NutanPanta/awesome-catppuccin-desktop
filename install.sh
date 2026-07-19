@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Awesome WM + Catppuccin Mocha desktop — one-shot installer for Arch Linux
+# Awesome WM + Catppuccin Mocha desktop: one-shot installer for Arch Linux
 #
 # Usage:
 #   ./install.sh              # install packages + deploy configs
@@ -7,7 +7,7 @@
 #   ./install.sh --dry-run
 #   ./install.sh --help
 #
-# Does NOT install camera/IPU7 stack — desktop theme and session only.
+# Desktop theme and session only.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
