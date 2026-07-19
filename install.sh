@@ -191,8 +191,8 @@ ${BLUE}Next steps:${NC}
 
 ${BLUE}Keybindings (defaults):${NC}
   Super+Enter     kitty
-  Super+d / Super+r   rofi app launcher
-  Super+Shift+e   rofi powermenu
+  Super+p         rofi app launcher
+  Super+d         calculator
   Super+w         wallpaper picker
   Print           flameshot
 

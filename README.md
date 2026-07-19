@@ -70,19 +70,19 @@ Log out and back in, then choose **Awesome** at the login screen.
 | Reload Awesome | `Super+Ctrl+r` |
 | Reload polybar | `polybar-msg cmd restart` |
 | Change wallpaper | `Super+w` (rofi picker) |
-| Powermenu | `Super+Shift+e` |
+| Powermenu | Polybar power icon (click) |
 
 ## Keybindings (default)
 
 | Keys | Action |
 |------|---------|
 | `Super+Enter` | Kitty terminal |
-| `Super+d` / `Super+r` | Rofi app launcher |
-| `Super+Shift+e` | Powermenu |
+| `Super+p` | Rofi app launcher |
+| `Super+d` | Calculator |
 | `Super+w` | Wallpaper picker |
 | `Print` | Flameshot |
 | `Super+1-9` | Switch workspace / tag |
-| `Super+Shift+q` | Kill focused window |
+| `Super+Shift+c` | Close focused window |
 
 ## Requirements
 

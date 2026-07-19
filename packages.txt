@@ -36,6 +36,7 @@ copyq
 arandr
 gpick
 python
+rofi-calc
 
 # Optional apps (not installed by default)
 # google-chrome
