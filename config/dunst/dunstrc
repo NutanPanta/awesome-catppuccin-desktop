@@ -1,0 +1,30 @@
+[global]
+    monitor = "DPI-1"
+    follow = keyboard
+    geometry = "400x100-30+20"
+    font = JetBrainsMono Nerd Font 10
+    markup = full
+    format = "<b>%s</b>\n%b"
+    horizontal_padding = 12
+    vertical_padding = 8
+    frame_width = 2
+    frame_color = "#cba6f7"
+    separator_color = "#45475a"
+    sort = yes
+    idle_threshold = 120
+
+[urgency_low]
+    background = "#1e1e2e"
+    foreground = "#cdd6f4"
+    timeout = 5
+
+[urgency_normal]
+    background = "#1e1e2e"
+    foreground = "#cdd6f4"
+    timeout = 8
+
+[urgency_critical]
+    background = "#f38ba8"
+    foreground = "#1e1e2e"
+    frame_color = "#f38ba8"
+    timeout = 0

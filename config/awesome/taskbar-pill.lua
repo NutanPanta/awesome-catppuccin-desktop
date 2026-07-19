@@ -1,0 +1,267 @@
+-- HyDE-style center pill: pinned launchers + real app icons
+local awful = require("awful")
+local gears = require("gears")
+local wibox = require("wibox")
+local c = require("theme.catppuccin")
+
+local M = {}
+
+local ICON = 22
+local ITEM = 40
+local LAUNCHER_ICON = 18
+local ITEM_GAP = 8
+local PILL_PAD_X = 22
+local PILL_MIN_W = 420
+local PILL_BOTTOM_GAP = 8
+local PILL_H = ITEM + 6
+local RADIUS = 14
+local BAR_HEIGHT = 60
+
+local fallback_icons = {
+    ["google-chrome"] = "󰊯",
+    ["google-chrome-stable"] = "󰊯",
+    chromium = "󰊯",
+    firefox = "󰈹",
+    kitty = "󰆍",
+    alacritty = "󰆍",
+    wezterm = "󰆍",
+    thunar = "󰉋",
+    code = "󰨞",
+    ["code-oss"] = "󰨞",
+    cursor = "󰨞",
+    nvim = "󰈮",
+    spotify = "󰓇",
+    slack = "󰒱",
+    discord = "󰙯",
+    telegram = "󰚇",
+    ["netsoft-com.netsoft.hubstaff"] = "󰄉",
+}
+
+local function icon_for(cl)
+    return fallback_icons[(cl.class or ""):lower()] or "󰖟"
+end
+
+local skip = {
+    plank = true,
+    polybar = true,
+    awesome = true,
+    picom = true,
+    xfdesktop = true,
+    pavucontrol = true,
+}
+
+local function include_client(cl)
+    if not cl.valid or not cl.class or cl.class == "" then
+        return false
+    end
+    if cl.type == "desktop" or cl.type == "dock" then
+        return false
+    end
+    if skip[cl.class:lower()] then
+        return false
+    end
+    if cl.name and cl.name:lower():find("polybar", 1, true) then
+        return false
+    end
+    return true
+end
+
+local function launcher(icon, cmd, tip)
+    local w = wibox.widget {
+        {
+            markup = string.format(
+                '<span font="JetBrainsMono Nerd Font %d" foreground="%s">%s</span>',
+                LAUNCHER_ICON, c.text, icon
+            ),
+            align = "center",
+            valign = "center",
+            widget = wibox.widget.textbox,
+        },
+        forced_width = ITEM,
+        forced_height = ITEM,
+        widget = wibox.container.place,
+    }
+    w:buttons(gears.table.join(
+        awful.button({}, 1, function() awful.spawn(cmd) end)
+    ))
+    awful.tooltip { objects = { w }, text = tip, timer_delay = 0.2 }
+    return w
+end
+
+local function separator()
+    return wibox.widget {
+        {
+            forced_width = 1,
+            forced_height = ICON - 4,
+            bg = c.overlay0,
+            widget = wibox.container.background,
+        },
+        margins = { left = 12, right = 12, top = 8, bottom = 8 },
+        widget = wibox.container.margin,
+    }
+end
+
+local function pill_shape(cr, w, h)
+    gears.shape.partially_rounded_rect(cr, w, h, true, true, false, false, RADIUS)
+end
+
+function M.create(s)
+    local open_apps = wibox.widget {
+        spacing = ITEM_GAP,
+        layout = wibox.layout.fixed.horizontal,
+    }
+
+    local function make_client_item(cl)
+        local icon
+        if cl.icon then
+            icon = wibox.widget {
+                forced_width = ICON,
+                forced_height = ICON,
+                widget = awful.widget.clienticon,
+            }
+            icon.client = cl
+        else
+            icon = wibox.widget {
+                {
+                    markup = string.format(
+                        '<span font="JetBrainsMono Nerd Font %d" foreground="%s">%s</span>',
+                        ICON, c.text, icon_for(cl)
+                    ),
+                    align = "center",
+                    valign = "center",
+                    widget = wibox.widget.textbox,
+                },
+                forced_width = ICON,
+                forced_height = ICON,
+                widget = wibox.container.place,
+            }
+        end
+
+        local bg = wibox.widget {
+            {
+                icon,
+                left = 8,
+                right = 8,
+                top = 5,
+                bottom = 5,
+                widget = wibox.container.margin,
+            },
+            forced_width = ITEM,
+            forced_height = ITEM,
+            bg = (cl == client.focus) and c.mauve or c.surface1,
+            shape = function(cr, w, h)
+                gears.shape.rounded_rect(cr, w, h, 8)
+            end,
+            widget = wibox.container.background,
+        }
+
+        bg:buttons(gears.table.join(
+            awful.button({}, 1, function()
+                if cl == client.focus then
+                    cl.minimized = true
+                else
+                    cl:emit_signal("request::activate", "tasklist", { raise = true })
+                end
+            end),
+            awful.button({}, 3, function()
+                awful.menu.client_list { theme = { width = 260 } }
+            end)
+        ))
+
+        awful.tooltip {
+            objects = { bg },
+            timer_delay = 0.2,
+            text = cl.name or cl.class,
+        }
+
+        return bg
+    end
+
+    local function refresh_apps()
+        local items = {}
+        for _, cl in ipairs(client.get()) do
+            if include_client(cl) then
+                items[#items + 1] = make_client_item(cl)
+            end
+        end
+        open_apps:set_children(items)
+    end
+
+    local launchers = wibox.widget {
+        spacing = ITEM_GAP,
+        layout = wibox.layout.fixed.horizontal,
+        launcher("󰀻", "rofi -modi drun,run -show drun", "Apps"),
+        launcher("󰉋", "thunar", "Files"),
+        launcher("󰆍", os.getenv("TERMINAL") or "kitty", "Terminal"),
+    }
+
+    local pill_row = wibox.widget {
+        layout = wibox.layout.fixed.horizontal,
+        launchers,
+        separator(),
+        open_apps,
+    }
+
+    local pill = wibox.widget {
+        {
+            pill_row,
+            left = PILL_PAD_X,
+            right = PILL_PAD_X,
+            top = 3,
+            bottom = 3,
+            widget = wibox.container.margin,
+        },
+        bg = c.surface0,
+        shape = pill_shape,
+        widget = wibox.container.background,
+    }
+
+    s.pill_bar = awful.popup {
+        screen = s,
+        widget = pill,
+        ontop = true,
+        visible = true,
+        type = "dock",
+        border_width = 0,
+    }
+
+    s.pill_bar:struts { left = 0, right = 0, top = 0, bottom = 0 }
+
+    local function place()
+        refresh_apps()
+        local geo = s.geometry
+        local w = select(1, pill:fit(s, geo.width, geo.height)) or 220
+        w = math.max(PILL_MIN_W, math.ceil(w))
+        local h = select(2, pill:fit(s, geo.width, geo.height)) or PILL_H
+        h = math.max(PILL_H, math.ceil(h))
+        local bar_h = BAR_HEIGHT
+        local y = geo.y + bar_h - PILL_BOTTOM_GAP - h
+
+        s.pill_bar:geometry {
+            x = geo.x + math.floor((geo.width - w) / 2),
+            y = y,
+            width = w,
+            height = h,
+        }
+    end
+
+    place()
+
+    local function on_client_change()
+        gears.timer.delayed_call(place)
+    end
+
+    s:connect_signal("property::workarea", place)
+    s:connect_signal("property::geometry", place)
+    client.connect_signal("manage", on_client_change)
+    client.connect_signal("unmanage", on_client_change)
+    client.connect_signal("focus", on_client_change)
+    client.connect_signal("property::minimized", on_client_change)
+    client.connect_signal("property::hidden", on_client_change)
+    client.connect_signal("property::class", on_client_change)
+    client.connect_signal("property::icon", on_client_change)
+    client.connect_signal("tagged", on_client_change)
+    client.connect_signal("untagged", on_client_change)
+end
+
+return M

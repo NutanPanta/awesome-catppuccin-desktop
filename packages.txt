@@ -1,0 +1,43 @@
+# Arch Linux packages for Awesome WM + Catppuccin desktop
+# Core session
+awesome
+picom
+feh
+polybar
+rofi
+dunst
+kitty
+xorg-xset
+polkit-gnome
+xdg-desktop-portal
+xdg-desktop-portal-gtk
+
+# Audio (PipeWire)
+pipewire
+pipewire-pulse
+pipewire-alsa
+wireplumber
+pavucontrol
+
+# Network / Bluetooth / power
+networkmanager
+blueman
+xfce4-power-manager
+
+# Theming
+papirus-icon-theme
+noto-fonts
+ttf-jetbrains-mono-nerd
+
+# Apps referenced in keybindings / scripts
+thunar
+flameshot
+copyq
+arandr
+gpick
+python
+
+# Optional (install manually with yay if you use them)
+# catppuccin-gtk-theme-mocha
+# google-chrome
+# nvim
