@@ -31,7 +31,7 @@ askAction() {
         askConfirm "awesome-client 'awesome.quit()'"
         ;;
     *"Lock screen")
-        askConfirm "loginctl lock-session ${XDG_SESSION_ID-}"
+        askConfirm "${HOME}/.local/bin/lock-screen"
         ;;
     *)
         exit 0

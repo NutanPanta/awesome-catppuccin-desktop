@@ -17,6 +17,8 @@ TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 
 INSTALL_PACKAGES=1
 DRY_RUN=0
+FINGERPRINT_SENSOR=0
+LOCK_SCREEN_BIN="${HOME}/.local/bin/lock-screen"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -37,6 +39,10 @@ Awesome WM + Catppuccin desktop installer
   ./install.sh --config-only   Skip package install, only deploy configs
   ./install.sh --dry-run       Show what would happen
   ./install.sh --help          This help
+
+If a previous install left root-owned files (e.g. from pkexec setup scripts),
+install.sh backs them up, removes them with one sudo prompt, and redeploys
+with your user ownership automatically.
 
 After install:
   1. Log out and back in (or reboot) if you were added to new groups
@@ -69,6 +75,59 @@ if [[ ! -d "$CONFIG_SRC" ]]; then
     exit 1
 fi
 
+require_deploy_tools() {
+    local -a missing=()
+    local cmd
+
+    for cmd in rsync cp mkdir find; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing+=("$cmd")
+        fi
+    done
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    err "Missing tools required to deploy configs: ${missing[*]}"
+    if [[ "$INSTALL_PACKAGES" -eq 0 ]]; then
+        err "Re-run without --config-only, or install manually: sudo pacman -S rsync"
+    else
+        err "Package install did not provide required tools. Try: sudo pacman -S rsync"
+    fi
+    exit 1
+}
+
+has_fingerprint_sensor() {
+    local out
+
+    if command -v fprintd-list >/dev/null 2>&1; then
+        out=$(fprintd-list "$USER" 2>/dev/null) || true
+        if [[ "$out" =~ found\ ([1-9][0-9]*)\ devices ]] || [[ "$out" == *"Device at "* ]]; then
+            return 0
+        fi
+    fi
+
+    if command -v lsusb >/dev/null 2>&1; then
+        if lsusb 2>/dev/null | grep -qiE \
+            'finger|fprint|goodix.*moc|synaptics.*metallica|elan.*fingerprint|058f:9540|06cb:00bd|27c6:5[0-9a-f]{3}'; then
+            return 0
+        fi
+    fi
+
+    [[ -d /sys/class/fingerprint ]]
+}
+
+detect_fingerprint_sensor() {
+    if has_fingerprint_sensor; then
+        FINGERPRINT_SENSOR=1
+        log "Fingerprint sensor detected."
+    else
+        FINGERPRINT_SENSOR=0
+        log "No fingerprint sensor detected — using password-only lock screen."
+    fi
+}
+
 install_packages() {
     local pkgfile="${REPO_ROOT}/packages.txt"
     local -a pkgs=()
@@ -88,6 +147,11 @@ install_packages() {
 
     if [[ ${#pkgs[@]} -eq 0 ]]; then
         return 0
+    fi
+
+    if [[ "$FINGERPRINT_SENSOR" -eq 1 ]]; then
+        pkgs+=(fprintd)
+        log "Including fprintd for fingerprint unlock."
     fi
 
     log "Installing ${#pkgs[@]} pacman packages..."
@@ -112,6 +176,35 @@ backup_if_exists() {
     fi
 }
 
+prepare_deploy_dest() {
+    local path="$1"
+    local kind="${2:-dir}"
+
+    run mkdir -p "$(dirname "$path")"
+
+    if [[ ! -e "$path" ]]; then
+        if [[ "$kind" == dir ]]; then
+            run mkdir -p "$path"
+        fi
+        return 0
+    fi
+
+    if [[ -O "$path" && -w "$path" ]]; then
+        return 0
+    fi
+
+    warn "Replacing protected ${path} (sudo required once)..."
+    if ! run sudo rm -rf "$path"; then
+        err "Install needs sudo to replace ${path}."
+        err "Approve the prompt when asked, then re-run ./install.sh"
+        return 1
+    fi
+
+    if [[ "$kind" == dir ]]; then
+        run mkdir -p "$path"
+    fi
+}
+
 deploy_tree() {
     local name="$1"
     local src="${CONFIG_SRC}/${name}"
@@ -123,13 +216,22 @@ deploy_tree() {
     fi
 
     backup_if_exists ".config/${name}"
-    run mkdir -p "$(dirname "$dest")"
+
     if [[ -d "$src" ]]; then
-        run mkdir -p "$dest"
-        run rsync -a --delete "${src}/" "${dest}/"
+        prepare_deploy_dest "$dest" dir || return 1
+        if ! run rsync -a --delete --no-owner --no-group "${src}/" "${dest}/"; then
+            err "Failed to deploy .config/${name}"
+            return 1
+        fi
     else
-        run cp -a "$src" "$dest"
+        prepare_deploy_dest "$dest" file || return 1
+        if ! run cp -a "$src" "$dest"; then
+            err "Failed to deploy .config/${name}"
+            return 1
+        fi
+        run chmod u+rw "$dest" 2>/dev/null || true
     fi
+
     log "Deployed .config/${name}"
 }
 
@@ -141,6 +243,7 @@ deploy_fehbg() {
         return 0
     fi
     backup_if_exists ".fehbg"
+    prepare_deploy_dest "$dest" file || return 1
     run cp -a "$src" "$dest"
     run chmod +x "$dest"
     log "Installed ~/.fehbg"
@@ -173,7 +276,75 @@ make_scripts_executable() {
         -type f \( -name '*.sh' -o -name 'launch.sh' -o -name 'fehbg' \) 2>/dev/null)
 }
 
+install_lock_screen() {
+    local bindir="${HOME}/.local/bin"
+    local icondir="${HOME}/.local/share/i3lock-fancy/icons"
+    local src_icons="${REPO_ROOT}/assets/i3lock-fancy/icons"
+    local script target
+    local -a scripts=(i3lock-fancy)
+
+    run mkdir -p "$bindir" "$icondir"
+
+    if [[ "$FINGERPRINT_SENSOR" -eq 1 ]]; then
+        scripts+=(i3lock-fancy-fingerprint)
+        target="${bindir}/i3lock-fancy-fingerprint"
+    else
+        run rm -f "${bindir}/i3lock-fancy-fingerprint"
+        target="${bindir}/i3lock-fancy"
+    fi
+
+    for name in "${scripts[@]}"; do
+        script="${REPO_ROOT}/scripts/${name}"
+        if [[ ! -f "$script" ]]; then
+            warn "Missing lock script: ${script}"
+            continue
+        fi
+        run cp -a "$script" "${bindir}/${name}"
+        run chmod +x "${bindir}/${name}"
+        log "Installed ~/.local/bin/${name}"
+    done
+
+    if [[ -d "$src_icons" ]]; then
+        run cp -a "${src_icons}/." "$icondir/"
+        log "Installed lock screen icons -> ~/.local/share/i3lock-fancy/icons"
+    fi
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo -e "${BLUE}[dry-run]${NC} write ${LOCK_SCREEN_BIN} -> exec ${target}"
+        return 0
+    fi
+
+    cat > "$LOCK_SCREEN_BIN" <<EOF
+#!/usr/bin/env bash
+# Installed by awesome-catppuccin-desktop install.sh — do not edit.
+exec "${target}" "\$@"
+EOF
+    chmod +x "$LOCK_SCREEN_BIN"
+    log "Installed ${LOCK_SCREEN_BIN#${HOME}/} -> ${target#${HOME}/}"
+
+    if [[ "$FINGERPRINT_SENSOR" -eq 1 ]] && ! command -v fprintd-verify >/dev/null 2>&1; then
+        warn "fprintd is missing — install packages or run: sudo pacman -S fprintd"
+    fi
+}
+
+run_optional_setup() {
+    local script="$1"
+    local label="$2"
+
+    if [[ ! -x "$script" ]]; then
+        return 0
+    fi
+
+    warn "${label} (requires root — run manually if needed):"
+    echo "  pkexec env SUDO_USER=${USER} ${script}"
+}
+
 print_summary() {
+    local lock_note="Password lock screen (~/.local/bin/i3lock-fancy)"
+    if [[ "$FINGERPRINT_SENSOR" -eq 1 ]]; then
+        lock_note="Fingerprint lock screen (~/.local/bin/i3lock-fancy-fingerprint)"
+    fi
+
     cat <<EOF
 
 ${GREEN}Done.${NC} Desktop configs are installed.
@@ -183,11 +354,15 @@ ${BLUE}Included:${NC}
   • Polybar (menu, workspaces, volume slider, WiFi, Bluetooth, power)
   • Picom blur, Rofi launcher, Kitty terminal, Dunst notifications
   • GTK 3/4 theme hints, PipeWire audio profile, wallpapers via feh
+  • ${lock_note}
 
 ${BLUE}Next steps:${NC}
   1. Log out and log back in (or reboot)
   2. Choose Awesome at the login screen
   3. If audio is silent: bash ~/.config/awesome/fix-audio.sh
+  4. Touchscreen gestures: pkexec env SUDO_USER=${USER} ${REPO_ROOT}/scripts/setup-touch.sh
+  5. LightDM greeter theme: pkexec env SUDO_USER=${USER} ${REPO_ROOT}/scripts/setup-lightdm.sh
+  6. Before reloading Awesome: ~/.config/awesome/scripts/check-config.sh
 
 ${BLUE}Keybindings (defaults):${NC}
   Super+Enter     kitty
@@ -205,11 +380,15 @@ main() {
     log "Awesome + Catppuccin desktop installer"
     log "Repo: ${REPO_ROOT}"
 
+    detect_fingerprint_sensor
+
     if [[ "$INSTALL_PACKAGES" -eq 1 ]]; then
         install_packages
     else
         log "Skipping package install (--config-only)."
     fi
+
+    require_deploy_tools
 
     log "Deploying configs (existing files backed up first)..."
     deploy_tree "awesome"
@@ -222,10 +401,16 @@ main() {
     deploy_tree "gtk-4.0"
     deploy_tree "wallpapers"
     deploy_tree "wireplumber"
+    deploy_tree "xfce4"
+    deploy_tree "touchegg"
     deploy_fehbg
 
+    install_lock_screen
     fix_pipewire_audio
     make_scripts_executable
+
+    run_optional_setup "${REPO_ROOT}/scripts/setup-touch.sh" "Touchscreen (input group + touchegg)"
+    run_optional_setup "${REPO_ROOT}/scripts/setup-lightdm.sh" "LightDM greeter"
 
     print_summary
 }

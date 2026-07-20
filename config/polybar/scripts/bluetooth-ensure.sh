@@ -13,6 +13,12 @@ controller_powered() {
     controller_ready && bluetoothctl show 2>/dev/null | grep -q "Powered: yes"
 }
 
+ghost_hci_present() {
+    [[ -e /sys/class/bluetooth/hci0 ]] || return 1
+    [[ -r /sys/class/bluetooth/hci0/address ]] && return 1
+    return 0
+}
+
 unblock_bluetooth() {
     command -v rfkill &>/dev/null || return 0
 
@@ -34,6 +40,28 @@ run_root() {
     pkexec "$@" 2>/dev/null
 }
 
+enable_thinkpad_bluetooth() {
+    [[ -r /proc/acpi/ibm/bluetooth ]] || return 0
+    grep -q '^status:[[:space:]]*enabled' /proc/acpi/ibm/bluetooth && return 0
+
+    notify "Bluetooth" "Enabling ThinkPad Bluetooth radio…"
+    run_root bash -c 'echo enable > /proc/acpi/ibm/bluetooth' || return 1
+    sleep 1
+}
+
+reset_hci_controller() {
+    [[ -w /sys/class/bluetooth/hci0/reset ]] && {
+        notify "Bluetooth" "Resetting Bluetooth adapter…"
+        echo 1 > /sys/class/bluetooth/hci0/reset 2>/dev/null && sleep 2 && return 0
+    }
+
+    [[ -e /sys/class/bluetooth/hci0/reset ]] || return 1
+
+    notify "Bluetooth" "Resetting Bluetooth adapter…"
+    run_root bash -c 'echo 1 > /sys/class/bluetooth/hci0/reset' || return 1
+    sleep 2
+}
+
 start_bluetooth_service() {
     systemctl is-active --quiet bluetooth 2>/dev/null && return 0
 
@@ -51,7 +79,7 @@ restart_bluetooth_service() {
 reload_bluetooth_modules() {
     lsmod | grep -qE '^(btintel_pcie|btintel|bluetooth)\b' || return 1
 
-    notify "Bluetooth" "Reloading Bluetooth driver…"
+    notify "Bluetooth" "Reloading Intel Bluetooth driver…"
     run_root bash -c '
         modprobe -r btintel_pcie btintel 2>/dev/null || true
         modprobe btintel_pcie 2>/dev/null || modprobe btintel 2>/dev/null || modprobe bluetooth
@@ -65,8 +93,21 @@ power_on_controller() {
     sleep 1
 }
 
+recover_ghost_hci() {
+    ghost_hci_present || return 1
+
+    enable_thinkpad_bluetooth || true
+    reset_hci_controller || return 1
+    restart_bluetooth_service || true
+    unblock_bluetooth
+    power_on_controller
+
+    controller_powered
+}
+
 ensure_bluetooth() {
     unblock_bluetooth
+    enable_thinkpad_bluetooth || true
 
     if controller_powered; then
         return 0
@@ -77,12 +118,22 @@ ensure_bluetooth() {
         controller_powered && return 0
     fi
 
+    if recover_ghost_hci; then
+        notify "Bluetooth" "Bluetooth recovered."
+        return 0
+    fi
+
     start_bluetooth_service || true
     unblock_bluetooth
 
     if controller_ready; then
         power_on_controller
         controller_powered && return 0
+    fi
+
+    if recover_ghost_hci; then
+        notify "Bluetooth" "Bluetooth recovered."
+        return 0
     fi
 
     restart_bluetooth_service || true
@@ -96,6 +147,11 @@ ensure_bluetooth() {
         fi
     fi
 
+    if recover_ghost_hci; then
+        notify "Bluetooth" "Bluetooth recovered."
+        return 0
+    fi
+
     reload_bluetooth_modules || true
     unblock_bluetooth
     power_on_controller
@@ -105,7 +161,7 @@ ensure_bluetooth() {
         return 0
     fi
 
-    notify "Bluetooth" "Could not enable Bluetooth. Reboot if this keeps happening."
+    notify "Bluetooth" "Bluetooth adapter failed to start. Try: sudo bash ~/.config/polybar/scripts/bluetooth-ensure.sh"
     return 1
 }
 

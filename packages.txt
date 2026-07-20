@@ -1,4 +1,8 @@
 # Arch Linux packages for Awesome WM + Catppuccin desktop
+
+# Installer (install.sh deploys configs with rsync)
+rsync
+
 # Core session
 awesome
 picom
@@ -21,8 +25,13 @@ pavucontrol
 
 # Network / Bluetooth / power
 networkmanager
+bluez-utils
 blueman
 xfce4-power-manager
+
+# Display manager + greeter
+lightdm
+lightdm-gtk-greeter
 
 # Theming
 papirus-icon-theme
@@ -39,6 +48,17 @@ python
 rofi-calc
 snixembed
 xdotool
+xorg-xprop
+imagemagick
+i3lock
+fontconfig
+touchegg
+xorg-xinput
+
+# fprintd is installed by install.sh only when a fingerprint sensor is detected
+
+# Optional (fix-audio.sh audible test; install if you want it)
+# alsa-utils
 
 # Optional apps (not installed by default)
 # google-chrome

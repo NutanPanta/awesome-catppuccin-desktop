@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Fingerprint unlock wrapper for i3lock-fancy.
+# Uses fprintd-verify (no sudoers needed). Restarts fprintd via pkexec if the device is claimed.
+
+set -euo pipefail
+
+log_file="${HOME}/.local/share/i3lock-fingerprint/fingerprint_login.log"
+VERIFY_TIMEOUT=10
+I3LOCK_FANCY="${I3LOCK_FANCY:-${HOME}/.local/bin/i3lock-fancy}"
+
+mkdir -p "$(dirname "$log_file")"
+
+log() {
+    echo "$(date "+%Y-%m-%d %H:%M:%S") - $1" >> "$log_file"
+}
+
+cleanup_and_exit() {
+    log "Script finished."
+    exit
+}
+
+handle_sleep() {
+    log "Entering sleep mode."
+}
+
+handle_resume() {
+    log "Resuming from sleep."
+    run_main_loop
+}
+
+verify_fingerprint() {
+    log "Starting fingerprint verification."
+
+    fingerprint_output=$(timeout "$VERIFY_TIMEOUT" fprintd-verify 2>&1)
+    exit_code=$?
+
+    log "Fingerprint Output: $fingerprint_output"
+
+    if echo "$fingerprint_output" | grep -q "Device was already claimed"; then
+        log "Device was already claimed, attempting to restart fprintd service."
+        if command -v pkexec >/dev/null 2>&1; then
+            pkexec systemctl restart fprintd 2>&1 >> "$log_file"
+        else
+            sudo systemctl restart fprintd 2>&1 >> "$log_file"
+        fi
+        sleep 1
+        return 2
+    elif echo "$fingerprint_output" | grep -q "verify-match"; then
+        log "Fingerprint matched!"
+        return 0
+    elif [[ $exit_code -eq 124 ]]; then
+        log "Fingerprint verification timed out (expired)."
+        return 1
+    else
+        log "Fingerprint not matched or verification failed."
+        return 1
+    fi
+}
+
+is_i3lock_running() {
+    local pid=$1
+    if [[ -n "$pid" ]] && ps -p "$pid" >/dev/null 2>&1; then
+        return 0
+    fi
+    if pgrep -f "i3lock" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+run_main_loop() {
+    log "Starting main loop."
+
+    if [[ ! -x "$I3LOCK_FANCY" ]]; then
+        log "Missing i3lock-fancy at ${I3LOCK_FANCY}"
+        exit 1
+    fi
+
+    "$I3LOCK_FANCY" &
+    i3lock_fancy_pid=$!
+    sleep 1
+
+    while is_i3lock_running "$i3lock_fancy_pid"; do
+        verify_fingerprint
+        verify_result=$?
+
+        if [[ $verify_result -eq 0 ]]; then
+            log "Unlocking screen."
+            pkill -f "i3lock.*"
+            break
+        elif [[ $verify_result -eq 2 ]]; then
+            log "Device claimed issue resolved, retrying verification."
+            sleep 1
+        else
+            log "Fingerprint verification expired. Waiting before restarting..."
+            wait_time=3
+            while [[ $wait_time -gt 0 ]] && is_i3lock_running "$i3lock_fancy_pid"; do
+                sleep 1
+                wait_time=$((wait_time - 1))
+            done
+            if is_i3lock_running "$i3lock_fancy_pid"; then
+                log "Restarting fingerprint verification (user may have attempted password)."
+            else
+                log "i3lock process ended."
+                break
+            fi
+        fi
+    done
+
+    log "Main loop ended."
+}
+
+trap handle_sleep INT
+trap handle_resume CONT
+
+exec >> "$log_file" 2>&1
+
+log "Script started."
+
+run_main_loop

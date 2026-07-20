@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # List systray embed windows left-to-right for alignment during tray clicks.
-# Output: INDEX PRIMARY_CLASS SECONDARY_CLASS WM_NAME
+# Output (tab-separated): INDEX PRIMARY SECONDARY WID NAME
 
 export DISPLAY="${DISPLAY:-:0}"
+SCAN_TIMEOUT="${TRAY_SCAN_TIMEOUT:-3}"
 
 is_tray_sized() {
     local wid=$1
@@ -38,10 +39,16 @@ while IFS= read -r wid; do
     eval "$(xdotool getwindowgeometry --shell "$wid" 2>/dev/null)" || continue
     sorted+=("$X:$wid")
 done < <(
-    {
+    timeout "$SCAN_TIMEOUT" bash -c '
+        line="$(xprop -root _NET_CLIENT_LIST 2>/dev/null || true)"
+        if [[ -n "$line" ]]; then
+            grep -oE "0x[0-9a-fA-F]+" <<<"$line" || true
+        fi
+        # Tray embeds (Slack, Hubstaff, etc.) are not in _NET_CLIENT_LIST.
         xdotool search --onlyvisible --name "." 2>/dev/null || true
-        xdotool search --name "." 2>/dev/null || true
-    } | sort -u
+        xdotool search --class snixembed 2>/dev/null || true
+        xdotool search --class Snixembed 2>/dev/null || true
+    ' 2>/dev/null | sort -u
 )
 
 if ((${#sorted[@]} == 0)); then
@@ -55,6 +62,6 @@ for entry in "${sorted[@]}"; do
     wid=${entry#*:}
     read -r primary secondary <<<"$(read_wm_class "$wid")"
     name="$(read_wm_name "$wid")"
-    printf '%s %s %s %s\n' "$index" "$primary" "$secondary" "$name"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$index" "$primary" "$secondary" "$wid" "$name"
     index=$((index + 1))
 done

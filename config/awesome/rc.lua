@@ -34,6 +34,7 @@ beautiful.init("~/.config/awesome/theme/theme.lua")
 
 terminal = "kitty"
 editor = os.getenv("EDITOR") or "nvim"
+lock_screen = os.getenv("HOME") .. "/.local/bin/lock-screen"
 modkey = "Mod4"
 
 local function cycle_client(delta)
@@ -144,7 +145,7 @@ globalkeys = gears.table.join(
 
     -- Screen lock
     awful.key({ modkey, "Control" }, "l", function()
-        awful.spawn("i3lock-fancy-fingerprint")
+        awful.spawn(lock_screen)
     end, { description = "lock screen", group = "system" }),
 
     -- Window management

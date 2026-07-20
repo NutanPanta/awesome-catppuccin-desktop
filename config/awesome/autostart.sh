@@ -11,7 +11,7 @@ run_once() {
 }
 
 SCREEN_BLANK_MINUTES=15
-SCREEN_LOCK_COMMAND="i3lock-fancy-fingerprint"
+SCREEN_LOCK_COMMAND="${HOME}/.local/bin/lock-screen"
 
 set_xfconf_int() {
     local prop=$1

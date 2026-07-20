@@ -44,6 +44,10 @@ local cache = {
     at = 0,
 }
 
+local BUS_LIST_TTL = 8
+local bus_list_cache = { at = 0, text = "", lines = {} }
+local refresh_ctx
+
 local function shell_output(cmd)
     local handle = io.popen(cmd .. " 2>/dev/null")
     if not handle then
@@ -52,6 +56,55 @@ local function shell_output(cmd)
     local out = handle:read("*a") or ""
     handle:close()
     return out
+end
+
+local function get_bus_list_lines()
+    if os.time() - bus_list_cache.at < BUS_LIST_TTL and #bus_list_cache.lines > 0 then
+        return bus_list_cache.lines, bus_list_cache.text
+    end
+
+    local text = shell_output("busctl --user list")
+    bus_list_cache.text = text
+    bus_list_cache.lines = {}
+    for line in text:gmatch("[^\n]+") do
+        bus_list_cache.lines[#bus_list_cache.lines + 1] = line
+    end
+    bus_list_cache.at = os.time()
+    return bus_list_cache.lines, bus_list_cache.text
+end
+
+local function begin_refresh_ctx()
+    refresh_ctx = { trees = {}, introspect = {} }
+    get_bus_list_lines()
+end
+
+local function end_refresh_ctx()
+    refresh_ctx = nil
+end
+
+local function get_bus_tree(service)
+    if refresh_ctx and refresh_ctx.trees[service] then
+        return refresh_ctx.trees[service]
+    end
+
+    local tree = shell_output("busctl --user tree " .. service)
+    if refresh_ctx then
+        refresh_ctx.trees[service] = tree
+    end
+    return tree
+end
+
+local function get_introspect(service, path)
+    local key = service .. "\0" .. path
+    if refresh_ctx and refresh_ctx.introspect[key] then
+        return refresh_ctx.introspect[key]
+    end
+
+    local intro = shell_output(string.format("busctl --user introspect %q %q", service, path))
+    if refresh_ctx then
+        refresh_ctx.introspect[key] = intro
+    end
+    return intro
 end
 
 local function normalize_id(value)
@@ -180,11 +233,12 @@ local function service_on_bus(service)
     if not service:match("^:") then
         return shell_output("busctl --user status " .. service) ~= ""
     end
-    return shell_output("busctl --user list"):find(service, 1, true) ~= nil
+    local _, text = get_bus_list_lines()
+    return text:find(service, 1, true) ~= nil
 end
 
 local function service_pid(service)
-    for line in shell_output("busctl --user list"):gmatch("[^\n]+") do
+    for _, line in ipairs(get_bus_list_lines()) do
         local bus, pid = line:match("^(%S+)%s+(%d+)")
         if bus == service and pid then
             return tonumber(pid)
@@ -193,7 +247,7 @@ local function service_pid(service)
 end
 
 local function find_sni_path(service)
-    local tree = shell_output("busctl --user tree " .. service)
+    local tree = get_bus_tree(service)
     local best
 
     for line in tree:gmatch("[^\n]+") do
@@ -222,7 +276,7 @@ local function find_sni_path(service)
 end
 
 local function find_menu_path(service)
-    local tree = shell_output("busctl --user tree " .. service)
+    local tree = get_bus_tree(service)
     local candidates = {}
 
     for line in tree:gmatch("[^\n]+") do
@@ -237,7 +291,7 @@ local function find_menu_path(service)
     table.insert(candidates, 1, "/com/canonical/dbusmenu")
 
     for _, path in ipairs(candidates) do
-        local intro = shell_output(string.format("busctl --user introspect %q %q", service, path))
+        local intro = get_introspect(service, path)
         if intro:find("com.canonical.dbusmenu", 1, true)
             or intro:find("DbusMenu", 1, true)
         then
@@ -373,13 +427,13 @@ local function skip_scan_entry(scan)
 end
 
 local function service_has_sni_path(service)
-    local tree = shell_output("busctl --user tree " .. service)
+    local tree = get_bus_tree(service)
     return tree:find("/StatusNotifierItem", 1, true) ~= nil
         or tree:find("NotificationItem", 1, true) ~= nil
 end
 
 local function has_sni_at(service, path)
-    local intro = shell_output(string.format("busctl --user introspect %q %q", service, path))
+    local intro = get_introspect(service, path)
     if intro:find("StatusNotifierItem", 1, true) then
         return true
     end
@@ -452,10 +506,7 @@ local function refresh_sni_map()
         return
     end
 
-    local bus_lines = {}
-    for line in shell_output("busctl --user list"):gmatch("[^\n]+") do
-        bus_lines[#bus_lines + 1] = line
-    end
+    local bus_lines = get_bus_list_lines()
 
     for _, scan in ipairs(cache.scan) do
         if skip_scan_entry(scan) then
@@ -536,28 +587,21 @@ local function find_service_for_scan(scan)
     end
 
     local best
-    for line in shell_output("busctl --user list"):gmatch("[^\n]+") do
+    for _, line in ipairs(get_bus_list_lines()) do
         local bus, _, proc = line:match("^(%S+)%s+(%d+)%s+(%S+)")
         if bus and proc and proc_matches_scan(proc, scan) then
             local candidate = resolve_sni_service(bus)
             if candidate then
                 best = candidate
             end
-        end
-    end
-    if best then
-        return best
-    end
-
-    for line in shell_output("busctl --user list"):gmatch("[^\n]+") do
-        local bus = line:match("^(%S+)")
-        if bus and bus_matches_scan(bus, scan) then
+        elseif bus and bus_matches_scan(bus, scan) then
             local candidate = resolve_sni_service(bus)
             if candidate then
-                return candidate
+                best = candidate
             end
         end
     end
+    return best
 end
 
 local function class_matches(item, class_name)
@@ -694,6 +738,7 @@ function M.refresh(force)
         return cache.items
     end
 
+    begin_refresh_ctx()
     refresh_scan()
     refresh_sni_map()
 
@@ -731,11 +776,19 @@ function M.refresh(force)
     cache.items = items
     cache.by_id = final_by_id
     cache.at = os.time()
+    end_refresh_ctx()
     return items
 end
 
 function M.list()
     return M.refresh(false)
+end
+
+function M.cached_items()
+    if #cache.items > 0 then
+        return cache.items
+    end
+    return {}
 end
 
 function M.refresh_icons()
@@ -821,7 +874,7 @@ function M.set_match_items(items)
     match_items = items
 end
 
-function M.match_client(cl)
+function M.match_client(cl, allow_refresh)
     if not cl or not cl.class then
         return nil
     end
@@ -830,8 +883,12 @@ function M.match_client(cl)
     local cls_tokens = app_tokens(cl.class)
     local items = match_items or cache.items
 
-    if #items == 0 then
+    if #items == 0 and allow_refresh ~= false then
         items = M.list()
+    end
+
+    if #items == 0 then
+        return nil
     end
 
     for _, item in ipairs(items) do

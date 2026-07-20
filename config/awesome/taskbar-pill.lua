@@ -101,9 +101,14 @@ local function live_tray_icon(item, force)
 end
 
 local function poll_tray_icons()
-    local changed = false
+    local items = tray_registry.cached_items()
+    if #items == 0 then
+        return false
+    end
 
-    for _, item in ipairs(tray_registry.list()) do
+    local changed = tray_registry.refresh_icons()
+
+    for _, item in ipairs(items) do
         local path = live_tray_icon(item, true)
         if path and last_tray_icons[item.id] ~= path then
             last_tray_icons[item.id] = path
@@ -241,8 +246,80 @@ local function icon_for(cl)
     return fallback_icons[(cl.class or ""):lower()] or "󰖟"
 end
 
+local function prettify_class(class)
+    if not class or class == "" then
+        return nil
+    end
+    local name = class:gsub("_", " "):gsub("-", " ")
+    return name:sub(1, 1):upper() .. name:sub(2)
+end
+
+local function clean_label(text)
+    if type(text) ~= "string" then
+        return nil
+    end
+    text = text:gsub("^%s+", ""):gsub("%s+$", "")
+    text = text:gsub('^"(.*)"$', "%1")
+    if text == "" or not text:match("%S") then
+        return nil
+    end
+    if #text > 80 then
+        text = text:sub(1, 77) .. "..."
+    end
+    return text
+end
+
+local function first_label(...)
+    for i = 1, select("#", ...) do
+        local label = clean_label(select(i, ...))
+        if label then
+            return label
+        end
+    end
+end
+
+local function label_for_client(cl)
+    if not cl then
+        return "Window"
+    end
+    return first_label(cl.name, prettify_class(cl.class)) or "Window"
+end
+
+local function label_for_tray(item, cl, entry)
+    return first_label(
+        cl and cl.name,
+        entry and entry.name,
+        item and item.title,
+        item and item.id_prop,
+        item and item.id and item.id:gsub("-", " "),
+        item and item.wm_class and prettify_class(item.wm_class)
+    ) or "App"
+end
+
+local function tooltip_text(text)
+    return clean_label(text) or "App"
+end
+
 local function is_tray_app(cl)
-    return tray_registry.match_client(cl) ~= nil
+    return tray_registry.match_client(cl, false) ~= nil
+end
+
+local function is_obvious_tray_embed(cl)
+    if not cl.valid then
+        return false
+    end
+
+    local cls = (cl.class or ""):lower()
+    if cls:find("status_icon", 1, true) or cls == "snixembed" then
+        return true
+    end
+
+    local w, h = cl.width, cl.height
+    if w and h and w > 0 and h > 0 and w <= 64 and h <= 64 then
+        return true
+    end
+
+    return false
 end
 
 local skip = {
@@ -254,7 +331,7 @@ local skip = {
     pavucontrol = true,
 }
 
-local function include_client(cl)
+local function include_client(cl, fast)
     if not cl.valid or not cl.class or cl.class == "" then
         return false
     end
@@ -267,7 +344,11 @@ local function include_client(cl)
     if cl.name and cl.name:lower():find("polybar", 1, true) then
         return false
     end
-    if is_tray_app(cl) then
+    if fast then
+        if is_obvious_tray_embed(cl) then
+            return false
+        end
+    elseif is_tray_app(cl) then
         return false
     end
     return true
@@ -475,8 +556,11 @@ function M.create(s)
             single_shot = true,
             callback = function()
                 refresh_debounce = nil
-                if place then
-                    place()
+                if safe_refresh_apps then
+                    safe_refresh_apps()
+                end
+                if safe_layout_pill then
+                    safe_layout_pill()
                 end
             end,
         }
@@ -499,7 +583,7 @@ function M.create(s)
 
     local function remember_tray_client(cl, item)
         local entry = tracked[item.id] or {}
-        entry.name = cl.name or item.title
+        entry.name = label_for_tray(item, cl, entry)
         entry.theme_icon = item.icon_path or lookup_app_icon(cl) or entry.theme_icon
         entry.nerd_icon = icon_for(cl)
         entry.item = item
@@ -559,7 +643,7 @@ function M.create(s)
         awful.tooltip {
             objects = { bg },
             timer_delay = 0.2,
-            text = cl.name or cl.class,
+            text = tooltip_text(label_for_client(cl)),
         }
 
         return bg
@@ -567,7 +651,6 @@ function M.create(s)
 
     local function make_tray_item(item, cl)
         local entry = tracked[item.id] or {
-            name = item.title,
             theme_icon = item.icon_path,
             nerd_icon = (cl and icon_for(cl))
                 or fallback_icons[(item.id_prop or item.id or ""):lower():match("^(%w+)")]
@@ -575,7 +658,7 @@ function M.create(s)
             item = item,
         }
 
-        entry.name = item.title or entry.name
+        entry.name = label_for_tray(item, cl, entry)
         entry.theme_icon = item.icon_path or entry.theme_icon
         entry.item = item
         tracked[item.id] = entry
@@ -638,10 +721,24 @@ function M.create(s)
         awful.tooltip {
             objects = { bg },
             timer_delay = 0.2,
-            text = entry.name or item.title or item.id,
+            text = tooltip_text(entry.name),
         }
 
         return bg
+    end
+
+    local function refresh_clients_only()
+        local items = {}
+        highlight_widgets = {}
+
+        for _, cl in ipairs(client.get()) do
+            if include_client(cl, true) then
+                items[#items + 1] = make_client_item(cl)
+            end
+        end
+
+        open_apps:set_children(items)
+        update_focus_highlights()
     end
 
     local function refresh_apps()
@@ -678,7 +775,7 @@ function M.create(s)
                         or fallback_icons[(item.id_prop or ""):lower():match("^(%w+)")]
                         or "󰖟",
                 }
-                tracked[item.id].name = item.title
+                tracked[item.id].name = label_for_tray(item, nil, tracked[item.id])
                 tracked[item.id].theme_icon = item.icon_path
                 tracked[item.id].item = item
                 if item.icon_path then
@@ -767,7 +864,24 @@ function M.create(s)
     safe_refresh_apps = pill_guard("refresh", refresh_apps)
     safe_layout_pill = pill_guard("layout", layout_pill)
 
+    local startup_pending = true
+
     place = pill_guard("place", function()
+        if startup_pending then
+            startup_pending = false
+            refresh_clients_only()
+            safe_layout_pill()
+            gears.timer.delayed_call(function()
+                if safe_refresh_apps then
+                    safe_refresh_apps()
+                end
+                if safe_layout_pill then
+                    safe_layout_pill()
+                end
+            end)
+            return
+        end
+
         safe_refresh_apps()
         safe_layout_pill()
     end)
