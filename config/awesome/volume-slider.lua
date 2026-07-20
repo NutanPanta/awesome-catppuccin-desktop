@@ -338,4 +338,13 @@ function M.toggle()
     by_screen[s].toggle()
 end
 
+function M.hide()
+    local s = awful.screen.focused()
+    if not s or not by_screen[s] then
+        return
+    end
+
+    by_screen[s].hide()
+end
+
 return M
