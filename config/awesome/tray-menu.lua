@@ -15,6 +15,7 @@ local EMBED_CLICK = os.getenv("HOME") .. "/.config/awesome/scripts/tray-embed-cl
 local MENU_W = 280
 local ROW_H = 28
 local BAR_CLEARANCE = 64
+local TOP_BAR_H = 60
 
 local awful_menu_theme = {
     width = MENU_W,
@@ -248,10 +249,16 @@ local function hide_menu()
     hide_awful_menu()
     if active_popup then
         active_popup.visible = false
+        if active_popup.destroy then
+            active_popup:destroy()
+        end
         active_popup = nil
     end
     if active_overlay then
         active_overlay.visible = false
+        if active_overlay.destroy then
+            active_overlay:destroy()
+        end
         active_overlay = nil
     end
 end
@@ -341,9 +348,9 @@ local function show_menu_overlay(screen)
 
     active_overlay:geometry {
         x = geo.x,
-        y = geo.y,
+        y = geo.y + TOP_BAR_H,
         width = geo.width,
-        height = geo.height,
+        height = math.max(geo.height - TOP_BAR_H, 0),
     }
 
     active_overlay:buttons(gears.table.join(

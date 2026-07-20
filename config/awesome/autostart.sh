@@ -116,11 +116,12 @@ if command -v systemctl &>/dev/null; then
     done
 fi
 
-if [[ -x "$HOME/.config/polybar/launch.sh" ]]; then
+if ! pgrep -u "$USER" -x polybar >/dev/null \
+    && [[ -x "$HOME/.config/polybar/launch.sh" ]]; then
     "$HOME/.config/polybar/launch.sh"
 fi
 
-run_once "awesome-polybar-watchdog" bash -c '
+run_once "polybar-watchdog-loop" bash -c '
 while sleep 30; do
     pgrep -u "$USER" -x polybar >/dev/null && continue
     [[ -x "$HOME/.config/polybar/launch.sh" ]] || continue

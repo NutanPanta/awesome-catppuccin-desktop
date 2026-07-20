@@ -227,13 +227,17 @@ function M.create(s)
     end
 
     local function stop_grabbers()
-        if state.mousegrabber then
-            mousegrabber.stop()
-            state.mousegrabber = false
-        end
         if state.keygrabber then
             awful.keygrabber.stop(state.keygrabber)
             state.keygrabber = nil
+        end
+        if state.mousegrabber then
+            gears.timer.delayed_call(function()
+                if state.mousegrabber then
+                    mousegrabber.stop()
+                    state.mousegrabber = false
+                end
+            end)
         end
     end
 
@@ -243,7 +247,14 @@ function M.create(s)
     end
 
     local function start_grabbers()
-        stop_grabbers()
+        if state.keygrabber then
+            awful.keygrabber.stop(state.keygrabber)
+            state.keygrabber = nil
+        end
+        if state.mousegrabber then
+            mousegrabber.stop()
+            state.mousegrabber = false
+        end
         state.mousegrabber = true
 
         mousegrabber.run(function(m)

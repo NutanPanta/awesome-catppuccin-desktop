@@ -100,6 +100,8 @@ screen.connect_signal("property::geometry", set_wallpaper)
 
 awful.screen.connect_for_each_screen(function(s)
     set_wallpaper(s)
+    -- Reserve space for polybar (override-redirect = true in polybar config).
+    awful.screen.padding(s, { top = 60 })
     awful.tag({ "1", "2", "3", "4", "5", "6", "7", "8", "9", "0" }, s, awful.layout.layouts[1])
 
     local ok, err = pcall(taskbar_pill.create, s)
@@ -266,6 +268,16 @@ awful.rules.rules = {
             placement = awful.placement.no_overlap + awful.placement.no_offscreen,
             titlebars_enabled = false,
         }
+    },
+    {
+        rule = { class = "Polybar" },
+        properties = {
+            border_width = 0,
+            focusable = false,
+            focus = false,
+            raise = false,
+            placement = awful.placement.top,
+        },
     },
     {
         rule_any = {
