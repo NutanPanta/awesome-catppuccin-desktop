@@ -9,26 +9,23 @@ local hotkeys_popup = require("awful.hotkeys_popup")
 require("awful.hotkeys_popup.keys")
 local taskbar_pill = require("taskbar-pill")
 local volume_slider = require("volume-slider")
+local awesome_log = require("awesome-log")
 
 -- Error handling
 if awesome.startup_errors then
-    naughty.notify({
-        preset = naughty.config.presets.critical,
-        title = "Oops, there were errors during startup!",
-        text = awesome.startup_errors
-    })
+    awesome_log.error("startup", awesome.startup_errors)
+    awesome_log.notify("Startup errors", awesome.startup_errors, { id = "startup" })
 end
 
 do
     local in_error = false
     awesome.connect_signal("debug::error", function(err)
-        if in_error then return end
+        if in_error then
+            return
+        end
         in_error = true
-        naughty.notify({
-            preset = naughty.config.presets.critical,
-            title = "Oops, an error happened!",
-            text = tostring(err)
-        })
+        awesome_log.error("awesome", err)
+        awesome_log.notify("Awesome error", tostring(err), { id = "debug-error" })
         in_error = false
     end)
 end
@@ -103,8 +100,26 @@ screen.connect_signal("property::geometry", set_wallpaper)
 awful.screen.connect_for_each_screen(function(s)
     set_wallpaper(s)
     awful.tag({ "1", "2", "3", "4", "5", "6", "7", "8", "9", "0" }, s, awful.layout.layouts[1])
-    taskbar_pill.create(s)
-    volume_slider.create(s)
+
+    local ok, err = pcall(taskbar_pill.create, s)
+    if not ok then
+        awesome_log.error("taskbar-pill.create", err)
+        awesome_log.notify(
+            "Taskbar pill unavailable",
+            "The center app bar failed to start. Polybar and window management still work.",
+            { id = "taskbar-pill-create" }
+        )
+    end
+
+    ok, err = pcall(volume_slider.create, s)
+    if not ok then
+        awesome_log.error("volume-slider.create", err)
+        awesome_log.notify(
+            "Volume slider unavailable",
+            tostring(err),
+            { id = "volume-slider-create" }
+        )
+    end
 end)
 
 root.buttons(gears.table.join(
@@ -115,6 +130,7 @@ root.buttons(gears.table.join(
 globalkeys = gears.table.join(
     awful.key({ modkey }, "s", hotkeys_popup.show_help, { description = "show help", group = "awesome" }),
     awful.key({ modkey, "Shift" }, "r", awesome.restart, { description = "reload awesome", group = "awesome" }),
+    awful.key({ modkey, "Shift" }, "Escape", awesome.restart, { description = "panic reload awesome", group = "awesome" }),
 
     -- Justus-style app launchers
     awful.key({ modkey }, "Return", function() awful.spawn(terminal) end, { description = "terminal", group = "launcher" }),
@@ -125,6 +141,11 @@ globalkeys = gears.table.join(
     awful.key({ modkey }, "p", function() awful.spawn("rofi -modi drun,run -show drun") end, { description = "app launcher", group = "launcher" }),
     awful.key({ modkey }, "w", function() awful.spawn(os.getenv("HOME") .. "/.config/rofi/scripts/wallpaper-picker.sh") end, { description = "wallpaper picker", group = "launcher" }),
     awful.key({ "Mod1" }, "Tab", function() awful.spawn("rofi -modi window,run -show window") end, { description = "window switcher", group = "launcher" }),
+
+    -- Screen lock
+    awful.key({ modkey, "Control" }, "l", function()
+        awful.spawn("i3lock-fancy-fingerprint")
+    end, { description = "lock screen", group = "system" }),
 
     -- Window management
     awful.key({ modkey, "Shift" }, "c", function()

@@ -10,12 +10,81 @@ run_once() {
     "$@" &
 }
 
-xset s off
-xset -dpms
-xset s noblank
+SCREEN_BLANK_MINUTES=15
+SCREEN_LOCK_COMMAND="i3lock-fancy-fingerprint"
+
+set_xfconf_int() {
+    local prop=$1
+    local val=$2
+    if xfconf-query -c xfce4-power-manager -p "$prop" -l &>/dev/null; then
+        xfconf-query -c xfce4-power-manager -p "$prop" -s "$val"
+    else
+        xfconf-query -c xfce4-power-manager -p "$prop" -n -t int -s "$val"
+    fi
+}
+
+set_xfconf_bool() {
+    local prop=$1
+    local val=$2
+    if xfconf-query -c xfce4-power-manager -p "$prop" -l &>/dev/null; then
+        xfconf-query -c xfce4-power-manager -p "$prop" -s "$val"
+    else
+        xfconf-query -c xfce4-power-manager -p "$prop" -n -t bool -s "$val"
+    fi
+}
+
+set_xfconf_string() {
+    local channel=$1
+    local prop=$2
+    local val=$3
+    if xfconf-query -c "$channel" -p "$prop" -l &>/dev/null; then
+        xfconf-query -c "$channel" -p "$prop" -s "$val"
+    else
+        xfconf-query -c "$channel" -p "$prop" -n -t string -s "$val"
+    fi
+}
+
+configure_screen_lock() {
+    if command -v xfconf-query &>/dev/null \
+        && command -v "$SCREEN_LOCK_COMMAND" &>/dev/null; then
+        set_xfconf_string "xfce4-session" "/general/LockCommand" "$SCREEN_LOCK_COMMAND"
+    fi
+}
+
+configure_screen_power() {
+    local minutes=$SCREEN_BLANK_MINUTES
+    local seconds=$((minutes * 60))
+
+    if command -v xfconf-query &>/dev/null; then
+        set_xfconf_bool "/xfce4-power-manager/dpms-enabled" "true"
+        set_xfconf_int "/xfce4-power-manager/blank-on-ac" "$minutes"
+        set_xfconf_int "/xfce4-power-manager/blank-on-battery" "$minutes"
+        set_xfconf_int "/xfce4-power-manager/dpms-on-ac-sleep" "$minutes"
+        set_xfconf_int "/xfce4-power-manager/dpms-on-battery-sleep" "$minutes"
+        set_xfconf_int "/xfce4-power-manager/dpms-on-ac-off" "0"
+        set_xfconf_int "/xfce4-power-manager/dpms-on-battery-off" "0"
+        set_xfconf_int "/xfce4-power-manager/inactivity-on-ac" "0"
+        set_xfconf_int "/xfce4-power-manager/inactivity-on-battery" "0"
+    fi
+
+    if command -v xset &>/dev/null; then
+        xset s off
+        xset s noblank
+        xset dpms "$seconds" "$seconds" "$seconds"
+        xset +dpms
+    fi
+}
+
+configure_screen_power
+configure_screen_lock
 
 run_once "polkit-gnome-authentication-agent" \
     /usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1
+
+if command -v touchegg &>/dev/null; then
+    pkill -u "$USER" -x touchegg 2>/dev/null || true
+    run_once "touchegg --daemon" touchegg --daemon
+fi
 
 if command -v picom &>/dev/null; then
     pkill picom 2>/dev/null || true
@@ -51,6 +120,14 @@ if [[ -x "$HOME/.config/polybar/launch.sh" ]]; then
     "$HOME/.config/polybar/launch.sh"
 fi
 
+run_once "awesome-polybar-watchdog" bash -c '
+while sleep 30; do
+    pgrep -u "$USER" -x polybar >/dev/null && continue
+    [[ -x "$HOME/.config/polybar/launch.sh" ]] || continue
+    "$HOME/.config/polybar/launch.sh"
+done
+'
+
 # Single top polybar — apps/taskbar in the center section.
 pkill -u "$USER" -x plank 2>/dev/null || true
 
@@ -61,6 +138,8 @@ pkill -u "$USER" -x blueman-applet 2>/dev/null || true
 pkill -u "$USER" -f "blueman-tray" 2>/dev/null || true
 
 run_once "xfce4-power-manager" xfce4-power-manager
+configure_screen_power
+configure_screen_lock
 
 if command -v dunst &>/dev/null; then
     if pgrep -u "$USER" -x dunst >/dev/null 2>&1; then

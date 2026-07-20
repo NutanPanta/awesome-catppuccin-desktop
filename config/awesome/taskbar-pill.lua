@@ -6,6 +6,7 @@ local beautiful = require("beautiful")
 local menubar_utils = require("menubar.utils")
 local tray_menu = require("tray-menu")
 local tray_registry = require("tray-registry")
+local awesome_log = require("awesome-log")
 local c = require("theme.catppuccin")
 
 local M = {}
@@ -119,6 +120,27 @@ local function poll_tray_icons()
     return changed
 end
 
+local function stop_pill_timers()
+    if M._icon_poll_timer then
+        M._icon_poll_timer:stop()
+    end
+    if M._tray_timer then
+        M._tray_timer:stop()
+    end
+end
+
+local function pill_guard(step, fn, max_failures)
+    return awesome_log.guard("taskbar-pill/" .. step, fn, {
+        max_failures = max_failures or 2,
+        title = "Taskbar pill disabled",
+        message = "The center app bar hit repeated errors and stopped updating. "
+            .. "Polybar, tags, and windows still work. Reload with Super+Shift+r.",
+        on_trip = stop_pill_timers,
+    })
+end
+
+local safe_poll_tray_icons = pill_guard("poll", poll_tray_icons, 3)
+
 local function ensure_icon_poll_timer()
     if M._icon_poll_timer then
         return
@@ -127,7 +149,9 @@ local function ensure_icon_poll_timer()
     M._icon_poll_timer = gears.timer {
         timeout = 4,
         autostart = true,
-        callback = poll_tray_icons,
+        callback = function()
+            safe_poll_tray_icons()
+        end,
     }
 end
 
@@ -262,7 +286,7 @@ local function ensure_systray(s)
                     M._systray_refresh_pending = true
                     gears.timer.start_new(0.3, function()
                         M._systray_refresh_pending = false
-                        poll_tray_icons()
+                        safe_poll_tray_icons()
                         for _, refresh in pairs(pill_refreshers) do
                             refresh()
                         end
@@ -429,6 +453,8 @@ function M.create(s)
     local place
     local layout_pill
     local refresh_debounce
+    local safe_layout_pill
+    local safe_refresh_apps
 
     local function update_focus_highlights()
         for _, entry in ipairs(highlight_widgets) do
@@ -457,9 +483,15 @@ function M.create(s)
     end
 
     local function schedule_layout()
-        if layout_pill then
-            gears.timer.delayed_call(layout_pill)
+        if not layout_pill then
+            return
         end
+        gears.timer.delayed_call(function()
+            local fn = safe_layout_pill or layout_pill
+            if fn then
+                fn()
+            end
+        end)
     end
 
     pill_refreshers[s.index] = schedule_refresh
@@ -706,11 +738,6 @@ function M.create(s)
 
     s.pill_bar:struts { left = 0, right = 0, top = 0, bottom = 0 }
 
-    place = function()
-        refresh_apps()
-        layout_pill()
-    end
-
     layout_pill = function()
         local geo = s.geometry
         local w = select(1, pill:fit(s, geo.width, geo.height)) or 220
@@ -737,6 +764,14 @@ function M.create(s)
         end
     end
 
+    safe_refresh_apps = pill_guard("refresh", refresh_apps)
+    safe_layout_pill = pill_guard("layout", layout_pill)
+
+    place = pill_guard("place", function()
+        safe_refresh_apps()
+        safe_layout_pill()
+    end)
+
     place()
 
     ensure_icon_poll_timer()
@@ -746,7 +781,7 @@ function M.create(s)
             timeout = 30,
             autostart = true,
             callback = function()
-                if poll_tray_icons() then
+                if safe_poll_tray_icons() then
                     for _, refresh in pairs(pill_refreshers) do
                         refresh()
                     end
