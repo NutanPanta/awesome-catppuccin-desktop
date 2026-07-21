@@ -241,6 +241,15 @@ def prepare_loopback(w, h, _pix):
         log(f"loopback {DEVICE}: {fourcc} {w}x{h}")
 
 
+def clear_loopback_capture_state():
+    """Release stale STREAMON on the loopback node (apps can leave capture stuck)."""
+    result = v4l2_ctl(DEVICE, "--stream-off")
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "").strip()
+        if err:
+            log(f"WARN: loopback stream-off: {err}")
+
+
 def load_hal_json():
     raw = open(HAL_JSON).read()
     raw = re.sub(r"//[^\n]*", "", raw)
@@ -587,12 +596,13 @@ class CameraBridge:
         self.is_active = False
         log("switching to idle feed (LED off)...")
         clear_hal_locks()
+        clear_loopback_capture_state()
         time.sleep(0.2)
         self._start_idle()
         log("IDLE — LED off (black feed still on /dev/video32)")
 
     def _loopback_streaming(self):
-        """True when an app has called STREAMON on /dev/video32 (not just opened the fd)."""
+        """True when sysfs reports a reader on the loopback (can stick after apps exit)."""
         for path in (SYSFS_STATE, SYSFS_STATE_ALT):
             try:
                 if open(path).read().strip() == "capture":
@@ -662,11 +672,13 @@ class CameraBridge:
         return False
 
     def is_captured(self):
-        if self._loopback_streaming():
-            return True
         if self._external_openers():
             return True
-        return self._pipewire_consumer_linked()
+        if self._pipewire_consumer_linked():
+            return True
+        # Do not trust loopback "capture" alone — v4l2loopback often stays stuck after
+        # Viber/Chrome exit, which would leave the imx471 LED on indefinitely.
+        return False
 
     def _schedule_activation(self):
         if time.monotonic() < self.activation_blocked_until:
