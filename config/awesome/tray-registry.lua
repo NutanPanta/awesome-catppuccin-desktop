@@ -1,5 +1,6 @@
 -- Discover tray apps from systray embed scan + DBus SNI (no hardcoded app list).
 
+local gears = require("gears")
 local menubar_utils = require("menubar.utils")
 
 local M = {}
@@ -47,8 +48,18 @@ local cache = {
 local BUS_LIST_TTL = 8
 local bus_list_cache = { at = 0, text = "", lines = {} }
 local refresh_ctx
+local bad_services = {}
+local refresh_inflight = false
 
-local function shell_output(cmd)
+local BUSCTL_TIMEOUT_S = 1
+local BAD_SERVICE_TTL_S = 180
+local MAX_BUS_ATTEMPTS = 2
+
+local function shell_output(cmd, timeout)
+    timeout = timeout or 0
+    if timeout > 0 then
+        cmd = "timeout " .. timeout .. " " .. cmd
+    end
     local handle = io.popen(cmd .. " 2>/dev/null")
     if not handle then
         return ""
@@ -56,6 +67,22 @@ local function shell_output(cmd)
     local out = handle:read("*a") or ""
     handle:close()
     return out
+end
+
+local function is_bad_service(service)
+    local until_t = bad_services[service]
+    if not until_t then
+        return false
+    end
+    if os.time() >= until_t then
+        bad_services[service] = nil
+        return false
+    end
+    return true
+end
+
+local function mark_bad_service(service)
+    bad_services[service] = os.time() + BAD_SERVICE_TTL_S
 end
 
 local function get_bus_list_lines()
@@ -73,8 +100,8 @@ local function get_bus_list_lines()
     return bus_list_cache.lines, bus_list_cache.text
 end
 
-local function begin_refresh_ctx()
-    refresh_ctx = { trees = {}, introspect = {} }
+local function begin_refresh_ctx(fast)
+    refresh_ctx = { trees = {}, introspect = {}, fast = fast ~= false }
     get_bus_list_lines()
 end
 
@@ -83,11 +110,17 @@ local function end_refresh_ctx()
 end
 
 local function get_bus_tree(service)
+    if is_bad_service(service) then
+        return ""
+    end
     if refresh_ctx and refresh_ctx.trees[service] then
         return refresh_ctx.trees[service]
     end
 
-    local tree = shell_output("busctl --user tree " .. service)
+    local tree = shell_output("busctl --user tree " .. service, BUSCTL_TIMEOUT_S)
+    if tree == "" then
+        mark_bad_service(service)
+    end
     if refresh_ctx then
         refresh_ctx.trees[service] = tree
     end
@@ -95,12 +128,15 @@ local function get_bus_tree(service)
 end
 
 local function get_introspect(service, path)
+    if is_bad_service(service) then
+        return ""
+    end
     local key = service .. "\0" .. path
     if refresh_ctx and refresh_ctx.introspect[key] then
         return refresh_ctx.introspect[key]
     end
 
-    local intro = shell_output(string.format("busctl --user introspect %q %q", service, path))
+    local intro = shell_output(string.format("busctl --user introspect %q %q", service, path), BUSCTL_TIMEOUT_S)
     if refresh_ctx then
         refresh_ctx.introspect[key] = intro
     end
@@ -143,7 +179,7 @@ local function bus_property(service, path, prop)
         service,
         path,
         prop
-    )))
+    ), BUSCTL_TIMEOUT_S))
 end
 
 local TRAY_ICON_SIZES = { 22, 24, 32, 16, 48, 64, 256 }
@@ -231,7 +267,7 @@ local function service_on_bus(service)
         return false
     end
     if not service:match("^:") then
-        return shell_output("busctl --user status " .. service) ~= ""
+        return shell_output("busctl --user status " .. service, BUSCTL_TIMEOUT_S) ~= ""
     end
     local _, text = get_bus_list_lines()
     return text:find(service, 1, true) ~= nil
@@ -372,7 +408,7 @@ end
 local function refresh_scan()
     cache.scan = {}
 
-    local handle = io.popen(SCAN_SCRIPT .. " 2>/dev/null")
+    local handle = io.popen("timeout 2 " .. SCAN_SCRIPT .. " 2>/dev/null")
     if not handle then
         return
     end
@@ -514,25 +550,42 @@ local function refresh_sni_map()
         end
 
         local service
+        local attempts = 0
         for _, line in ipairs(bus_lines) do
             local bus, _, proc = line:match("^(%S+)%s+(%d+)%s+(%S+)")
             if bus and proc and proc_matches_scan(proc, scan) then
-                local candidate = resolve_sni_service(bus)
-                if candidate then
-                    service = candidate
+                if not is_bad_service(bus) then
+                    attempts = attempts + 1
+                    local candidate = resolve_sni_service(bus)
+                    if candidate then
+                        service = candidate
+                        break
+                    end
+                    if attempts >= MAX_BUS_ATTEMPTS then
+                        break
+                    end
                 end
             end
         end
 
         if not service then
+            attempts = 0
             for _, line in ipairs(bus_lines) do
                 local bus = line:match("^(%S+)")
                 if bus and bus_matches_scan(bus, scan) then
+                    if is_bad_service(bus) then
+                        goto bus_continue
+                    end
+                    attempts = attempts + 1
                     service = resolve_sni_service(bus)
                     if service then
                         break
                     end
+                    if attempts >= MAX_BUS_ATTEMPTS then
+                        break
+                    end
                 end
+                ::bus_continue::
             end
         end
 
@@ -587,19 +640,31 @@ local function find_service_for_scan(scan)
     end
 
     local best
+    local attempts = 0
     for _, line in ipairs(get_bus_list_lines()) do
         local bus, _, proc = line:match("^(%S+)%s+(%d+)%s+(%S+)")
+        if bus and is_bad_service(bus) then
+            goto find_continue
+        end
         if bus and proc and proc_matches_scan(proc, scan) then
+            attempts = attempts + 1
             local candidate = resolve_sni_service(bus)
             if candidate then
                 best = candidate
+                break
             end
         elseif bus and bus_matches_scan(bus, scan) then
+            attempts = attempts + 1
             local candidate = resolve_sni_service(bus)
             if candidate then
                 best = candidate
+                break
             end
         end
+        if attempts >= MAX_BUS_ATTEMPTS then
+            break
+        end
+        ::find_continue::
     end
     return best
 end
@@ -634,8 +699,8 @@ local function build_item_from_scan(scan, service)
     local item = {
         id = id,
         service = service,
-        sni_path = service and find_sni_path(service) or "/StatusNotifierItem",
-        menu_path = service and find_menu_path(service) or nil,
+        sni_path = "/StatusNotifierItem",
+        menu_path = nil,
         title = title,
         id_prop = scan.secondary,
         wm_class = scan.secondary,
@@ -653,7 +718,10 @@ local function build_item_from_scan(scan, service)
         icon_path = nil,
     }
 
-    if service then
+    local fast = refresh_ctx and refresh_ctx.fast
+
+    if service and not fast then
+        item.sni_path = find_sni_path(service)
         local id_prop = bus_property(service, item.sni_path, "Id")
         local sni_title = bus_property(service, item.sni_path, "Title")
         if id_prop and id_prop ~= "" then
@@ -664,17 +732,16 @@ local function build_item_from_scan(scan, service)
         if sni_title and sni_title ~= "" then
             item.title = sni_title
         end
-        if not item.menu_path then
-            item.menu_path = find_menu_path(service)
-        end
+        item.menu_path = find_menu_path(service)
+        refresh_sni_icon(item)
     end
 
     item.launch = lookup_desktop_exec(item)
-    local pid = service and service_pid(service)
-    item.quit = pid and ("kill " .. pid) or ("pkill -fi " .. item.id_prop)
-
-    if service then
-        refresh_sni_icon(item)
+    if service and not fast then
+        local pid = service_pid(service)
+        item.quit = pid and ("kill " .. pid) or ("pkill -fi " .. item.id_prop)
+    else
+        item.quit = "pkill -fi " .. item.id_prop
     end
 
     if not item.icon_path then
@@ -716,7 +783,7 @@ local function merge_item(existing, incoming)
         end
     end
 
-    if primary.service and primary.sni_path then
+    if primary.service and primary.sni_path and not (refresh_ctx and refresh_ctx.fast) then
         local id_prop = bus_property(primary.service, primary.sni_path, "Id")
         local sni_title = bus_property(primary.service, primary.sni_path, "Title")
         if id_prop and id_prop ~= "" then
@@ -726,19 +793,18 @@ local function merge_item(existing, incoming)
         if sni_title and sni_title ~= "" then
             primary.title = sni_title
         end
+        refresh_sni_icon(primary)
     end
-
-    refresh_sni_icon(primary)
 
     return primary
 end
 
-function M.refresh(force)
+function M.refresh(force, full)
     if not force and os.time() - cache.at < CACHE_TTL and #cache.items > 0 then
         return cache.items
     end
 
-    begin_refresh_ctx()
+    begin_refresh_ctx(full ~= true)
     refresh_scan()
     refresh_sni_map()
 
@@ -782,6 +848,59 @@ end
 
 function M.list()
     return M.refresh(false)
+end
+
+function M.is_refreshing()
+    return refresh_inflight
+end
+
+function M.refresh_async(callback, full)
+    if refresh_inflight then
+        return
+    end
+    refresh_inflight = true
+    gears.timer.start_new(0, function()
+        local items = M.refresh(true, full)
+        refresh_inflight = false
+        if callback then
+            callback(items)
+        end
+    end)
+end
+
+function M.enrich_item(item)
+    if not item or not item.service or item._enriched then
+        return item
+    end
+
+    if is_bad_service(item.service) then
+        item._enriched = true
+        return item
+    end
+
+    item.sni_path = find_sni_path(item.service)
+    local id_prop = bus_property(item.service, item.sni_path, "Id")
+    local sni_title = bus_property(item.service, item.sni_path, "Title")
+    if id_prop and id_prop ~= "" then
+        item.id_prop = id_prop
+        item.id = normalize_id(id_prop)
+    end
+    if sni_title and sni_title ~= "" then
+        item.title = sni_title
+    end
+    item.menu_path = find_menu_path(item.service)
+    refresh_sni_icon(item)
+
+    local pid = service_pid(item.service)
+    if pid then
+        item.quit = "kill " .. pid
+    end
+
+    item._enriched = true
+    if cache.by_id[item.id] then
+        cache.by_id[item.id] = item
+    end
+    return item
 end
 
 function M.cached_items()

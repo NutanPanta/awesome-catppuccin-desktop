@@ -746,7 +746,16 @@ function M.create(s)
         local tray_with_window = {}
         highlight_widgets = {}
 
-        local tray_items = tray_registry.list()
+        local tray_items = tray_registry.cached_items()
+        if #tray_items == 0 then
+            if not tray_registry.is_refreshing() then
+                tray_registry.refresh_async(function()
+                    schedule_refresh()
+                end)
+            end
+        else
+            tray_items = tray_registry.list()
+        end
         tray_registry.set_match_items(tray_items)
 
         local clients = client.get()
@@ -871,12 +880,16 @@ function M.create(s)
             startup_pending = false
             refresh_clients_only()
             safe_layout_pill()
-            gears.timer.delayed_call(function()
-                if safe_refresh_apps then
-                    safe_refresh_apps()
-                end
-                if safe_layout_pill then
-                    safe_layout_pill()
+            gears.timer.start_new(0.15, function()
+                if not tray_registry.is_refreshing() then
+                    tray_registry.refresh_async(function()
+                        if safe_refresh_apps then
+                            safe_refresh_apps()
+                        end
+                        if safe_layout_pill then
+                            safe_layout_pill()
+                        end
+                    end)
                 end
             end)
             return

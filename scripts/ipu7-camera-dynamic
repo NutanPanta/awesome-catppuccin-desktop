@@ -1,0 +1,833 @@
+#!/usr/bin/env python3
+"""ThinkPad X9 IPU7 bridge — idle feed + on-demand imx471 for ffplay and PipeWire apps."""
+import gi
+
+gi.require_version("Gst", "1.0")
+gi.require_version("GstVideo", "1.0")
+gi.require_version("GLib", "2.0")
+from gi.repository import Gst, GstVideo, GLib
+import json as _json
+import os
+import re
+import subprocess
+import sys
+import fcntl
+import time
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+Gst.init(None)
+
+DEVICE = "/dev/video32"
+SENSOR = "/dev/v4l-subdev4"
+LOCK_PATH = os.environ.get(
+    "IPU7_BRIDGE_LOCK", "/run/ipu7-camera-dynamic.lock"
+)
+SYSFS_STATE = "/sys/class/video4linux/video32/device/state"
+# Fallback for older kernels / symlink layouts
+SYSFS_STATE_ALT = "/sys/devices/virtual/video4linux/video32/state"
+HAL_JSON = "/etc/camera/ipu7x/sensors/imx471-uf.json"
+PW_NODE = "ipu7-hal-camera"
+GST_DEBUG = os.environ.get("GST_DEBUG", "")
+OUT_FORMAT = os.environ.get("CAMERA_OUT_FORMAT", "yuy2").strip().lower()
+SENSOR_VFLIP = os.environ.get("CAMERA_SENSOR_VFLIP", "0").strip()
+GST_VFLIP = os.environ.get("CAMERA_GST_VFLIP", "vertical-flip").strip().lower()
+CHROMA = os.environ.get("CAMERA_CHROMA", "nv12").strip().lower()
+if CHROMA == "nv21":
+    CHROMA = "swapuv"
+COLOR_FIX = os.environ.get("CAMERA_COLOR_FIX", "none").strip().lower()
+# Gist luminance-normalised diagonal CCM (default when matrix mode enabled via systemd)
+CCM_RED = os.environ.get("CAMERA_CCM_RED", "1.0294,0,0,0")
+CCM_GREEN = os.environ.get("CAMERA_CCM_GREEN", "0,0.9621,0,0")
+CCM_BLUE = os.environ.get("CAMERA_CCM_BLUE", "0,0,1.2892,0")
+BALANCE_HUE = os.environ.get("CAMERA_BALANCE_HUE", "-0.35")
+BALANCE_SAT = os.environ.get("CAMERA_BALANCE_SAT", "1.25")
+ALWAYS_ON = os.environ.get("CAMERA_ALWAYS_ON", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+STOP_DELAY = float(os.environ.get("CAMERA_STOP_DELAY", "1.0"))
+POLL_MS = int(os.environ.get("CAMERA_POLL_MS", "300"))
+ACTIVATION_DELAY = float(os.environ.get("CAMERA_ACTIVATION_DELAY", "0.8"))
+ACTIVATION_BACKOFF = float(os.environ.get("CAMERA_ACTIVATION_BACKOFF", "10.0"))
+PW_UID = os.environ.get("CAMERA_PIPEWIRE_UID", "1000").strip()
+AWB_MODE = os.environ.get("CAMERA_AWB_MODE", "auto").strip().lower()
+
+AWB_MODE_ENUM = {
+    "auto": 0,
+    "daylight": 3,
+    "video_conferencing": 7,
+    "manual_gain": 10,
+}
+
+PREFERRED_RESOLUTIONS = [
+    (1920, 1080, 30),
+    (1280, 720, 30),
+    (640, 480, 30),
+]
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def acquire_singleton_lock():
+    """Only one bridge process may run — extras exit immediately."""
+    lock_fp = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log(f"another ipu7-camera-dynamic is already running (lock: {LOCK_PATH})")
+        sys.exit(0)
+    lock_fp.write(str(os.getpid()))
+    lock_fp.flush()
+    return lock_fp
+
+
+def parse_ccm_row(raw):
+    return [float(x.strip()) for x in raw.split(",")[:4]]
+
+
+def build_ccm_matrix():
+    rows = (parse_ccm_row(CCM_RED), parse_ccm_row(CCM_GREEN), parse_ccm_row(CCM_BLUE))
+    return np.array(rows, dtype=np.float32)[:, :3] if np is not None else rows
+
+
+def apply_icam_awb(icam):
+    """Optional AWB lock — failures are non-fatal (bad values must not break the stream)."""
+    if icam is None or AWB_MODE in ("", "auto"):
+        return
+    try:
+        if AWB_MODE == "gist":
+            icam.set_property("awb-mode", AWB_MODE_ENUM["manual_gain"])
+            icam.set_property("awb-gain-r", int(os.environ.get("CAMERA_AWB_GAIN_R", "145")))
+            icam.set_property("awb-gain-g", int(os.environ.get("CAMERA_AWB_GAIN_G", "115")))
+            icam.set_property("awb-gain-b", int(os.environ.get("CAMERA_AWB_GAIN_B", "165")))
+            log("AWB: gist manual gains")
+            return
+        if AWB_MODE not in AWB_MODE_ENUM:
+            log(f"WARN: unknown CAMERA_AWB_MODE={AWB_MODE!r}, leaving auto")
+            return
+        icam.set_property("awb-mode", AWB_MODE_ENUM[AWB_MODE])
+        log(f"AWB: locked to {AWB_MODE}")
+    except Exception as exc:
+        log(f"WARN: AWB setup failed ({exc}) — using HAL auto AWB")
+
+
+def apply_ccm_rgb_inplace(data, width, height, stride, matrix):
+    """Apply 3x3 CCM to packed RGB888 or RGBx in-place (numpy required)."""
+    if np is None:
+        return False
+    bpp = 3
+    if stride % width != 0:
+        bpp = stride // width
+    if bpp not in (3, 4):
+        return False
+    row_bytes = width * bpp
+    if stride == row_bytes:
+        frame = np.frombuffer(data, dtype=np.uint8).reshape((height, width, bpp))
+        rgb = frame[:, :, :3].astype(np.float32)
+        corrected = rgb @ matrix.T
+        np.clip(corrected, 0, 255, out=corrected)
+        frame[:, :, :3] = corrected.astype(np.uint8)
+        return True
+    buf = np.frombuffer(data, dtype=np.uint8)
+    for row in range(height):
+        start = row * stride
+        chunk = buf[start : start + row_bytes].reshape((width, bpp))
+        rgb = chunk[:, :3].astype(np.float32)
+        chunk[:, :3] = np.clip(rgb @ matrix.T, 0, 255).astype(np.uint8)
+    return True
+
+
+def ccm_transform_buffer(src_buf, vinfo, matrix):
+    """Read-only map → CCM on copy → new Gst.Buffer (never WRITE-map upstream)."""
+    ok, src_map = src_buf.map(Gst.MapFlags.READ)
+    if not ok:
+        return None
+    try:
+        size = src_map.size
+        data = bytearray(src_map.data[:size])
+    finally:
+        src_buf.unmap(src_map)
+
+    if not apply_ccm_rgb_inplace(
+        data, vinfo.width, vinfo.height, vinfo.stride[0], matrix
+    ):
+        return None
+
+    # Gi may expose map.data as read-only bytes — wrap corrected pixels directly.
+    dst_buf = Gst.Buffer.new_wrapped(bytes(data))
+    dst_buf.pts = src_buf.pts
+    dst_buf.dts = src_buf.dts
+    dst_buf.duration = src_buf.duration
+    return dst_buf
+
+
+def pipewire_runtime_dir():
+    env_dir = os.environ.get("PIPEWIRE_RUNTIME_DIR", "").strip()
+    if env_dir:
+        return env_dir
+    return f"/run/user/{PW_UID}"
+
+
+def pipewire_socket_ready():
+    runtime = pipewire_runtime_dir()
+    return os.path.exists(os.path.join(runtime, "pipewire-0"))
+
+
+def pipewire_requested():
+    return os.environ.get("CAMERA_PIPEWIRE", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def make_pw_stream_props():
+    """pipewiresink stream-properties must be a Gst.Structure, not a parse string."""
+    props, _end = Gst.Structure.from_string(
+        'props, media.class=(string)Video/Source, media.role=(string)Camera, '
+        f'node.name=(string){PW_NODE}, node.description=(string)"IPU7 Camera", '
+        'node.nick=(string)"IPU7 Camera", api.v4l2.cap.driver=(string)uvcvideo, '
+        'api.v4l2.cap.card=(string)"IPU7 Camera", '
+        'device.description=(string)"IPU7 Camera"'
+    )
+    return props
+
+
+def configure_pipewire_sink(pipeline):
+    pwsink = pipeline.get_by_name("pwsink")
+    if pwsink is None:
+        raise RuntimeError("pipewiresink element missing")
+    pwsink.set_property("mode", 2)
+    pwsink.set_property("stream-properties", make_pw_stream_props())
+
+
+def v4l2_ctl(dev, *args):
+    return subprocess.run(
+        ["v4l2-ctl", "-d", dev, *args],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def prepare_sensor():
+    v4l2_ctl(SENSOR, "--set-ctrl", "horizontal_flip=0")
+    v4l2_ctl(SENSOR, "--set-ctrl", f"vertical_flip={SENSOR_VFLIP}")
+    v4l2_ctl(SENSOR, "--set-ctrl", "test_pattern=0")
+
+
+def prepare_loopback(w, h, _pix):
+    fourcc = loopback_v4l2_fourcc()
+    result = v4l2_ctl(
+        DEVICE,
+        "--set-fmt-video",
+        f"width={w},height={h},pixelformat={fourcc}",
+    )
+    if result.returncode != 0:
+        log(
+            f"WARN: loopback format {fourcc} @ {w}x{h} failed "
+            f"({result.stderr.strip() or 'v4l2-ctl error'})"
+        )
+    else:
+        log(f"loopback {DEVICE}: {fourcc} {w}x{h}")
+
+
+def load_hal_json():
+    raw = open(HAL_JSON).read()
+    raw = re.sub(r"//[^\n]*", "", raw)
+    raw = re.sub(r",(\s*[}\]])", r"\1", raw)
+    return _json.loads(raw)
+
+
+def read_hal_resolutions():
+    try:
+        data = load_hal_json()
+        meta = data["CameraSettings"]["Sensor"][0]["StaticMetadata"]
+        cfgs = meta["supportedStreamConfig"]
+        supported_sizes = {(c["size"][0], c["size"][1]) for c in cfgs}
+        return [
+            (w, h, f)
+            for w, h, f in PREFERRED_RESOLUTIONS
+            if (w, h) in supported_sizes
+        ]
+    except Exception as e:
+        log(f"[res] could not parse HAL JSON: {e}")
+    return list(PREFERRED_RESOLUTIONS)
+
+
+def resolution_candidates():
+    cfg = os.environ.get("CAMERA_RESOLUTION", "auto").strip().lower()
+    if cfg != "auto":
+        parts = re.split(r"[x×]", cfg)
+        try:
+            if len(parts) == 3:
+                return [(int(parts[0]), int(parts[1]), int(parts[2]))]
+            if len(parts) == 2:
+                return [(int(parts[0]), int(parts[1]), 30)]
+        except ValueError:
+            pass
+    return read_hal_resolutions()
+
+
+def caps_raw(w, h, fps, fmt):
+    return (
+        f"video/x-raw,format={fmt},width={w},height={h},"
+        f"framerate={fps}/1,pixel-aspect-ratio=1/1,"
+        f"colorimetry=bt601,interlace-mode=progressive"
+    )
+
+
+def caps_yuy2(w, h, fps):
+    return (
+        f"video/x-raw,format=YUY2,width={w},height={h},"
+        f"framerate={fps}/1"
+    )
+
+
+def caps_rgb(w, h, fps):
+    return (
+        f"video/x-raw,format=RGB,width={w},height={h},"
+        f"framerate={fps}/1,pixel-aspect-ratio=1/1"
+    )
+
+
+def loopback_pix():
+    """GStreamer/v4l2sink format name."""
+    if OUT_FORMAT == "yuy2":
+        return "YUY2"
+    if OUT_FORMAT in ("rgb24", "rgb"):
+        return "RGB"
+    return "NV12"
+
+
+def loopback_v4l2_fourcc():
+    """V4L2 fourcc for v4l2-ctl --set-fmt-video (not the GStreamer format name)."""
+    if OUT_FORMAT == "yuy2":
+        return "YUYV"
+    if OUT_FORMAT in ("rgb24", "rgb"):
+        return "RGB3"
+    return "NV12"
+
+
+def output_caps(w, h, fps):
+    if OUT_FORMAT == "yuy2":
+        return caps_yuy2(w, h, fps)
+    if OUT_FORMAT in ("rgb24", "rgb"):
+        return caps_rgb(w, h, fps)
+    return caps_raw(w, h, fps, "NV12")
+
+
+def clear_hal_locks():
+    subprocess.run(["ipcrm", "-M", "0x43414D"], check=False, capture_output=True)
+    for path in ("/dev/shm/sem.camlock", "/run/camera/imx471-uf_VIDEO.aiqd"):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def icam_chain(w, h, fps, out):
+    """Minimal icam pipeline (same layout as working direct gst-launch test)."""
+    nv12 = (
+        f"video/x-raw,format=NV12,width={w},height={h},"
+        f"framerate={fps}/1"
+    )
+    chain = (
+        f"icamerasrc device-name=0 name=icam "
+        f"! capsfilter caps=\"{nv12}\" "
+        f"! videoconvert "
+    )
+    if CHROMA == "swapuv":
+        nv21 = (
+            f"video/x-raw,format=NV21,width={w},height={h},"
+            f"framerate={fps}/1"
+        )
+        chain += f"! capsfilter caps=\"{nv21}\" ! videoconvert "
+    if COLOR_FIX == "balance":
+        chain += (
+            f"! videobalance name=vb hue={BALANCE_HUE} saturation={BALANCE_SAT} "
+            f"! videoconvert "
+        )
+    elif COLOR_FIX == "matrix":
+        rgb_caps = (
+            f"video/x-raw,format=RGB,width={w},height={h},"
+            f"framerate={fps}/1"
+        )
+        chain += (
+            f"! capsfilter caps=\"{rgb_caps}\" "
+            f"! identity name=ccmix sync=true "
+            f"! videoconvert "
+        )
+    chain += f"! capsfilter caps=\"{out}\" "
+    return chain
+
+
+def camera_chain(w, h, fps):
+    out = output_caps(w, h, fps)
+    return icam_chain(w, h, fps, out)
+
+
+class CameraBridge:
+    def __init__(self):
+        self.pipeline = None
+        self.icam = None
+        self.is_active = False
+        self.use_pipewire = False
+        self.busy = False
+        self._last_opener_check = 0.0
+        self._cached_openers = False
+        self.w = 1920
+        self.h = 1080
+        self.fps = 30
+        self.no_capture_since = None
+        self.pending_activation = None
+        self.ccm_matrix = None
+        self._ccm_warned = False
+        self.activation_blocked_until = 0.0
+
+    def _defer(self, fn):
+        """Run pipeline work on the GLib main thread (GStreamer is not thread-safe)."""
+        GLib.idle_add(self._run_deferred, fn)
+
+    def _run_deferred(self, fn):
+        if self.busy:
+            return False
+        self.busy = True
+        try:
+            fn()
+        finally:
+            self.busy = False
+        return False
+
+    def _res_tag(self):
+        return f"{self.w}x{self.h}@{self.fps}"
+
+    def _flip_element(self):
+        if GST_VFLIP in ("none", "0", "false", "off"):
+            return ""
+        return f"! videoflip method={GST_VFLIP} "
+
+    def _sink_tail(self, out):
+        """Output chain shared by idle and camera pipelines."""
+        flip = self._flip_element()
+        if self.use_pipewire:
+            return (
+                f"{flip}! capsfilter caps=\"{out}\" "
+                f"! tee name=out allow-not-linked=true "
+                f"out. ! queue max-size-buffers=2 leaky=downstream "
+                f"! v4l2sink device={DEVICE} sync=false "
+                f"out. ! queue max-size-buffers=2 leaky=downstream "
+                f"! pipewiresink name=pwsink sync=false async=false "
+            )
+        return (
+            f"{flip}! capsfilter caps=\"{out}\" "
+            f"! queue max-size-buffers=2 leaky=downstream "
+            f"! v4l2sink device={DEVICE} sync=false "
+        )
+
+    def _idle_pipeline_desc(self, w, h, fps):
+        out = output_caps(w, h, fps)
+        prepare_loopback(w, h, loopback_pix())
+        return (
+            f"videotestsrc pattern=black is-live=true "
+            f"! capsfilter caps=\"{out}\" "
+            f"{self._sink_tail(out)}"
+        )
+
+    def _camera_pipeline_desc(self, w, h, fps):
+        out = output_caps(w, h, fps)
+        prepare_sensor()
+        prepare_loopback(w, h, loopback_pix())
+        cam = camera_chain(w, h, fps)
+        return (
+            f"{cam} "
+            f"! queue leaky=downstream max-size-buffers=2 "
+            f"{self._sink_tail(out)}"
+        )
+
+    def _stop_pipeline(self):
+        if not self.pipeline:
+            return
+        bus = self.pipeline.get_bus()
+        if bus:
+            bus.remove_signal_watch()
+        self.pipeline.set_state(Gst.State.NULL)
+        self.pipeline.get_state(2 * Gst.SECOND)
+        self.pipeline = None
+        self.icam = None
+        self.ccm_matrix = None
+        self._ccm_warned = False
+
+    def _launch_pipeline(self, desc, camera=False):
+        self.pipeline = Gst.parse_launch(desc)
+        if self.use_pipewire:
+            configure_pipewire_sink(self.pipeline)
+        if camera:
+            self.icam = self.pipeline.get_by_name("icam")
+            apply_icam_awb(self.icam)
+            if COLOR_FIX == "matrix":
+                self._attach_ccm_probe()
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self._on_bus)
+        self.pipeline.set_state(Gst.State.PLAYING)
+        ret, _state, _pending = self.pipeline.get_state(3 * Gst.SECOND)
+        return ret != Gst.StateChangeReturn.FAILURE
+
+    def build_idle(self, w, h, fps):
+        self.w, self.h, self.fps = w, h, fps
+        self._stop_pipeline()
+        desc = self._idle_pipeline_desc(w, h, fps)
+        return self._launch_pipeline(desc, camera=False)
+
+    def build_camera(self, w, h, fps):
+        self.w, self.h, self.fps = w, h, fps
+        clear_hal_locks()
+        self._stop_pipeline()
+        time.sleep(0.2)
+        desc = self._camera_pipeline_desc(w, h, fps)
+        return self._launch_pipeline(desc, camera=True)
+
+    def build(self, w, h, fps):
+        return self.build_idle(w, h, fps)
+
+    def _attach_ccm_probe(self):
+        ccm_el = self.pipeline.get_by_name("ccmix")
+        if ccm_el is None:
+            log("WARN: CCM identity missing — colour matrix disabled")
+            return
+        if np is None:
+            log(
+                "WARN: python-numpy missing — install python-numpy; "
+                "falling back to no CCM (try: sudo pacman -S python-numpy)"
+            )
+            return
+        self.ccm_matrix = build_ccm_matrix()
+        pad = ccm_el.get_static_pad("src")
+        pad.add_probe(Gst.PadProbeType.BUFFER, self._ccm_probe, None)
+        log(f"CCM matrix enabled via pad probe: {self.ccm_matrix.tolist()}")
+
+    def _ccm_probe(self, pad, info, _user_data):
+        buf = info.get_buffer()
+        if buf is None or self.ccm_matrix is None:
+            return Gst.PadProbeReturn.OK
+        caps = pad.get_current_caps()
+        if not caps:
+            return Gst.PadProbeReturn.OK
+        s = caps.get_structure(0)
+        fmt = s.get_string("format") if s else ""
+        if fmt not in ("RGB", "BGR"):
+            if not self._ccm_warned:
+                self._ccm_warned = True
+                log(f"WARN: CCM probe skipped — expected RGB/BGR, got {fmt!r}")
+            return Gst.PadProbeReturn.OK
+        vinfo = GstVideo.VideoInfo.new_from_caps(caps)
+        try:
+            new_buf = ccm_transform_buffer(buf, vinfo, self.ccm_matrix)
+        except Exception as exc:
+            if not self._ccm_warned:
+                self._ccm_warned = True
+                log(f"WARN: CCM pad probe error: {exc}")
+            return Gst.PadProbeReturn.OK
+        if new_buf is None:
+            if not self._ccm_warned:
+                self._ccm_warned = True
+                log("WARN: CCM pad probe failed to transform frame")
+            return Gst.PadProbeReturn.OK
+        info.set_buffer(new_buf)
+        return Gst.PadProbeReturn.OK
+
+    def start(self):
+        pw_note = " + PipeWire node ipu7-hal-camera" if self.use_pipewire else ""
+        log(
+            f"IDLE — black feed on {DEVICE}{pw_note} "
+            f"({OUT_FORMAT}, LED off until an app opens the camera)"
+        )
+        return True
+
+    def _start_idle(self):
+        if self.build_idle(self.w, self.h, self.fps):
+            pw_note = " + PipeWire node ipu7-hal-camera" if self.use_pipewire else ""
+            log(
+                f"IDLE — black feed on {DEVICE}{pw_note} "
+                f"({OUT_FORMAT}, LED off until an app opens the camera)"
+            )
+            return True
+        log("ERROR: idle pipeline failed to start")
+        return False
+
+    def go_active(self):
+        if self.is_active:
+            return
+
+        self.is_active = True
+        log(f"activating imx471 @ {self._res_tag()} (camera pipeline swap)")
+        if self.build_camera(self.w, self.h, self.fps):
+            log("ACTIVE — real camera on /dev/video32 (LED on)")
+            return
+
+        log(f"ERROR: camera pipeline failed — backoff {ACTIVATION_BACKOFF}s")
+        self.activation_blocked_until = time.monotonic() + ACTIVATION_BACKOFF
+        self.is_active = False
+        self._start_idle()
+
+    def go_idle(self):
+        if not self.is_active:
+            return
+
+        self.is_active = False
+        log("switching to idle feed (LED off)...")
+        clear_hal_locks()
+        time.sleep(0.2)
+        self._start_idle()
+        log("IDLE — LED off (black feed still on /dev/video32)")
+
+    def _loopback_streaming(self):
+        """True when an app has called STREAMON on /dev/video32 (not just opened the fd)."""
+        for path in (SYSFS_STATE, SYSFS_STATE_ALT):
+            try:
+                if open(path).read().strip() == "capture":
+                    return True
+            except OSError:
+                continue
+        return False
+
+    def _external_openers(self):
+        """True when another process has /dev/video32 open (cheap fuser check)."""
+        now = time.monotonic()
+        if now - self._last_opener_check < max(POLL_MS / 1000.0, 0.5):
+            return self._cached_openers
+        self._last_opener_check = now
+
+        my_pid = os.getpid()
+        try:
+            result = subprocess.run(
+                ["fuser", DEVICE],
+                capture_output=True,
+                text=True,
+                timeout=1,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            self._cached_openers = False
+            return False
+
+        openers = False
+        for token in result.stdout.split():
+            if token.isdigit() and int(token) != my_pid:
+                openers = True
+                break
+        self._cached_openers = openers
+        return openers
+
+    def _pipewire_consumer_linked(self):
+        """True only if a non-bridge client is linked to our optional pipewiresink node."""
+        if not self.use_pipewire:
+            return False
+        runtime = pipewire_runtime_dir()
+        env = os.environ.copy()
+        env["PIPEWIRE_RUNTIME_DIR"] = runtime
+        try:
+            r = subprocess.run(
+                ["pw-link", "-l"],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=2,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+        if r.returncode != 0:
+            return False
+        my_pid = os.getpid()
+        for line in r.stdout.splitlines():
+            if PW_NODE not in line or "->" not in line:
+                continue
+            # Ignore self-links inside the bridge pipeline.
+            if f"[{my_pid}]" in line or "ipu7-camera-dynamic" in line:
+                continue
+            # pw-link: "client-node:output -> ipu7-hal-camera:input"
+            if f"->{PW_NODE}:" in line.replace(" ", "") or f"-> {PW_NODE}:" in line:
+                return True
+        return False
+
+    def is_captured(self):
+        if self._loopback_streaming():
+            return True
+        if self._external_openers():
+            return True
+        return self._pipewire_consumer_linked()
+
+    def _schedule_activation(self):
+        if time.monotonic() < self.activation_blocked_until:
+            return
+        if self.is_active or self.pending_activation is not None or self.busy:
+            return
+        delay_ms = max(0, int(ACTIVATION_DELAY * 1000))
+        log(f"capturer detected — activating camera in {ACTIVATION_DELAY}s")
+        self.pending_activation = GLib.timeout_add(delay_ms, self._do_pending_activation)
+
+    def _do_pending_activation(self):
+        self.pending_activation = None
+        if not self.is_captured():
+            return False
+        if not self.is_active and not self.busy:
+            self._defer(self.go_active)
+        return False
+
+    def _cancel_pending_activation(self):
+        if self.pending_activation is not None:
+            GLib.source_remove(self.pending_activation)
+            self.pending_activation = None
+
+    def _on_poll(self):
+        if self.busy:
+            return True
+
+        if ALWAYS_ON:
+            if not self.is_active:
+                self._defer(self.go_active)
+            return True
+
+        capturing = self.is_captured()
+        active = self.is_active
+
+        if capturing:
+            self.no_capture_since = None
+            if not active:
+                self._schedule_activation()
+        elif active:
+            self._cancel_pending_activation()
+            if self.no_capture_since is None:
+                self.no_capture_since = time.monotonic()
+                log(f"capturer gone — LED off in {STOP_DELAY}s")
+            elif time.monotonic() - self.no_capture_since >= STOP_DELAY:
+                self.no_capture_since = None
+                self._defer(self.go_idle)
+        else:
+            self.no_capture_since = None
+
+        return True
+
+    def run(self):
+        acquire_singleton_lock()
+
+        if GST_DEBUG:
+            log(f"GST_DEBUG={GST_DEBUG}")
+
+        runtime = pipewire_runtime_dir()
+        os.environ.setdefault("PIPEWIRE_RUNTIME_DIR", runtime)
+        self.use_pipewire = pipewire_requested() and pipewire_socket_ready()
+        if pipewire_requested() and not self.use_pipewire:
+            log(f"PipeWire runtime not ready ({runtime}) — v4l2loopback only for now")
+        elif self.use_pipewire:
+            log(f"PipeWire sink enabled ({runtime}, node={PW_NODE})")
+
+        for attempt in range(15):
+            if os.path.exists(DEVICE):
+                break
+            if attempt == 0:
+                log(f"waiting for {DEVICE} (v4l2loopback)...")
+            subprocess.run(["modprobe", "v4l2loopback"], check=False, capture_output=True)
+            time.sleep(0.5)
+        if not os.path.exists(DEVICE):
+            log(f"FATAL: {DEVICE} missing — run: sudo modprobe v4l2loopback")
+            sys.exit(1)
+
+        if not any(os.path.exists(p) for p in ("/dev/psys", "/dev/ipu7-psys0")):
+            log("FATAL: PSYS device missing — run: sudo ~/.config/awesome/fix-camera.sh --fix-psys")
+            sys.exit(1)
+
+        candidates = resolution_candidates()
+        log(f"[res] candidates: {candidates}")
+
+        started = False
+        for w, h, fps in candidates:
+            log(f"[res] trying {w}x{h}@{fps}...")
+            try:
+                if self.build(w, h, fps):
+                    started = True
+                else:
+                    log(f"[res] {w}x{h}@{fps} failed, trying next")
+                    self._stop_pipeline()
+                    continue
+            except (GLib.GError, RuntimeError) as exc:
+                log(f"pipeline build failed @ {w}x{h}: {exc}")
+                self._stop_pipeline()
+                if self.use_pipewire:
+                    log("retrying without PipeWire sink...")
+                    self.use_pipewire = False
+                    try:
+                        if self.build(w, h, fps):
+                            started = True
+                        else:
+                            self._stop_pipeline()
+                            continue
+                    except (GLib.GError, RuntimeError) as exc2:
+                        log(f"pipeline build failed @ {w}x{h}: {exc2}")
+                        self._stop_pipeline()
+                        continue
+                else:
+                    continue
+            if started:
+                log(
+                    f"[res] using {w}x{h}@{fps} "
+                    f"({OUT_FORMAT}, color_fix={COLOR_FIX}, chroma={CHROMA})"
+                )
+                self.start()
+                break
+
+        if not started:
+            log("FATAL: all resolutions failed")
+            sys.exit(1)
+
+        if ALWAYS_ON:
+            log("CAMERA_ALWAYS_ON=1 — activating real camera immediately")
+            self.is_active = True
+            if not self.build_camera(self.w, self.h, self.fps):
+                log("FATAL: camera pipeline failed with CAMERA_ALWAYS_ON=1")
+                sys.exit(1)
+            log("ACTIVE — real camera on /dev/video32 (LED on)")
+
+        GLib.timeout_add(POLL_MS, self._on_poll)
+        GLib.MainLoop().run()
+
+    def _on_bus(self, _bus, msg):
+        if msg.type == Gst.MessageType.WARNING:
+            warn, dbg = msg.parse_warning()
+            src = msg.src.get_name() if msg.src else "pipeline"
+            log(f"GST WARN [{src}]: {warn.message}")
+            if dbg:
+                log(f"  debug: {dbg}")
+            return
+
+        if msg.type != Gst.MessageType.ERROR:
+            return
+
+        err, dbg = msg.parse_error()
+        src = msg.src.get_name() if msg.src else "pipeline"
+        log(f"GST ERROR [{src}]: {err.message}")
+        if dbg:
+            log(f"  debug: {dbg}")
+
+        if src == "icam" or (self.is_active and src in ("pipeline", "queue0", "queue1")):
+            self.activation_blocked_until = time.monotonic() + ACTIVATION_BACKOFF
+            log("icamerasrc error — reverting to idle black feed")
+            self._defer(self.go_idle)
+        elif not self.is_active and src in ("idle", "queue0", "queue1"):
+            log(f"WARN: idle pipeline error from [{src}] — restarting idle feed")
+            self._defer(self._start_idle)
+
+
+if __name__ == "__main__":
+    CameraBridge().run()

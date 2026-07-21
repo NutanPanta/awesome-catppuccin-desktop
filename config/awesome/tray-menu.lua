@@ -35,6 +35,8 @@ local active_awful_menu
 local menu_keygrabber
 local embed_busy = false
 local menu_generation = 0
+local GDBUS_TIMEOUT_S = 3
+local SHELL_TIMEOUT_S = 2
 
 local sni_menu_methods = {
     "org.kde.StatusNotifierItem.ContextMenu",
@@ -56,7 +58,11 @@ local function dbus_env_prefix()
     )
 end
 
-local function shell_output(cmd)
+local function shell_output(cmd, timeout)
+    timeout = timeout or 0
+    if timeout > 0 then
+        cmd = "timeout " .. timeout .. " " .. cmd
+    end
     local handle = io.popen(cmd .. " 2>/dev/null")
     if not handle then
         return ""
@@ -96,16 +102,37 @@ local function shell_ok(cmd, label, timeout)
     return ok
 end
 
-local function gdbus_call(service, path, method, ...)
-    local args = table.concat({ ... }, " ")
+local function gdbus_call(service, path, method, timeout, ...)
+    timeout = timeout or GDBUS_TIMEOUT_S
+    local parts = { ... }
+    local quoted = {}
+    for _, arg in ipairs(parts) do
+        quoted[#quoted + 1] = string.format("%q", arg)
+    end
+    local arg_str = table.concat(quoted, " ")
     return shell_output(string.format(
         "%sgdbus call --session -d %q -o %q -m %s -- %s",
         dbus_env_prefix(),
         service,
         path,
         method,
-        args
-    ))
+        arg_str
+    ), timeout)
+end
+
+local function dbus_get_layout_cmd(item)
+    return string.format(
+        "%stimeout %d %sgdbus call --session -d %q -o %q "
+            .. "-m com.canonical.dbusmenu.GetLayout -- %q %q %q",
+        dbus_env_prefix(),
+        GDBUS_TIMEOUT_S,
+        dbus_env_prefix(),
+        item.service,
+        item.menu_path,
+        "0",
+        "-1",
+        "[]"
+    )
 end
 
 local function menu_event(service, menu_path, item_id)
@@ -158,7 +185,7 @@ local function menu_window_near(x, y)
     local out = shell_output(string.format(
         "%sDISPLAY=%q bash -c '"
             .. "x=%d; y=%d; "
-            .. "for wid in $(xdotool search --onlyvisible . 2>/dev/null); do "
+            .. "for wid in $(xprop -root _NET_CLIENT_LIST 2>/dev/null | grep -oE \"0x[0-9a-fA-F]+\"); do "
             .. "[[ -z \"$wid\" ]] && continue; "
             .. "type=$(xprop -id \"$wid\" _NET_WM_WINDOW_TYPE 2>/dev/null || true); "
             .. "[[ \"$type\" == *POPUP* || \"$type\" == *MENU* || \"$type\" == *DROPDOWN* ]] || continue; "
@@ -169,7 +196,7 @@ local function menu_window_near(x, y)
         os.getenv("DISPLAY") or ":0",
         math.floor(x),
         math.floor(y)
-    ))
+    ), SHELL_TIMEOUT_S)
     return out:find("yes", 1, true) ~= nil
 end
 
@@ -467,22 +494,22 @@ local function build_dbus_entries(entries, service, menu_path)
 end
 
 local function try_dbus_menu(item, x, y)
-    if not item.menu_path then
+    if not item.menu_path or not item.service then
         return false
     end
 
-    gdbus_call(item.service, item.menu_path, "com.canonical.dbusmenu.AboutToShow", "0")
     local layout_out = gdbus_call(
         item.service,
         item.menu_path,
         "com.canonical.dbusmenu.GetLayout",
+        GDBUS_TIMEOUT_S,
         "0",
         "-1",
         "[]"
     )
 
     if layout_out == "" or layout_out:find("Usage:", 1, true) then
-        tray_log.info("dbus " .. item.id .. ": GetLayout empty or usage error")
+        tray_log.info("dbus " .. item.id .. ": GetLayout empty, timed out, or usage error")
         return false
     end
 
@@ -495,6 +522,37 @@ local function try_dbus_menu(item, x, y)
     tray_log.info("dbus " .. item.id .. ": showing " .. #entries .. " entries")
     show_menu(build_dbus_entries(entries, item.service, item.menu_path), x, y)
     return true
+end
+
+local function try_dbus_menu_async(item, x, y, gen, callback)
+    if not item.menu_path or not item.service then
+        callback(false)
+        return
+    end
+
+    awful.spawn.easy_async_with_shell(dbus_get_layout_cmd(item), function(stdout, _stderr, _reason, exit_code)
+        if gen ~= menu_generation then
+            callback(false)
+            return
+        end
+
+        if exit_code ~= 0 or not stdout or stdout == "" or stdout:find("Usage:", 1, true) then
+            tray_log.info("dbus " .. item.id .. ": GetLayout async failed exit=" .. tostring(exit_code))
+            callback(false)
+            return
+        end
+
+        local entries = parse_dbusmenu_layout(stdout)
+        if #entries == 0 then
+            tray_log.info("dbus " .. item.id .. ": parsed 0 menu entries (async)")
+            callback(false)
+            return
+        end
+
+        tray_log.info("dbus " .. item.id .. ": showing " .. #entries .. " entries (async)")
+        show_menu(build_dbus_entries(entries, item.service, item.menu_path), x, y)
+        callback(true)
+    end)
 end
 
 local function show_fallback(item, cl, x, y)
@@ -522,6 +580,17 @@ local function show_fallback(item, cl, x, y)
             end,
         },
     }, x, y)
+end
+
+local function clear_embed_busy_watchdog()
+    gears.timer.start_new(10, function()
+        if not embed_busy then
+            return
+        end
+        tray_log.info("embed_busy watchdog cleared")
+        embed_busy = false
+        require("taskbar-pill").restore_tray_host()
+    end)
 end
 
 local function finish_native_tray_menu(item, x, y, cl, gen, native_ok)
@@ -554,6 +623,7 @@ local function try_native_tray_menu(item, x, y, cl, gen)
     end
 
     embed_busy = true
+    clear_embed_busy_watchdog()
     local mx, my = menu_coords(x, y)
     local pill = require("taskbar-pill")
     pill.prepare_tray_menu(item, mx, my)
@@ -612,36 +682,59 @@ function M.show(item, cl, x, y)
 
     x = math.floor(x or 0)
     y = math.floor(y or 0)
+
     menu_generation = menu_generation + 1
     local gen = menu_generation
 
     hide_menu()
-    if not item.service and not item.menu_path then
-        tray_registry.refresh(true)
-    else
-        tray_registry.refresh(false)
-    end
-    item = tray_registry.get(item.id) or item
     tray_log.info(string.format("show %s at %d,%d", item.id, x, y))
 
-    local ok, err = pcall(function()
-        if try_dbus_menu(item, x, y) then
+    local function run_show()
+        local current = item
+        if current.service and not current._enriched then
+            current = tray_registry.enrich_item(current) or current
+        end
+
+        local ok, err = pcall(function()
+            if current.menu_path and current.service then
+                try_dbus_menu_async(current, x, y, gen, function(dbus_ok)
+                    if dbus_ok then
+                        embed_busy = false
+                        return
+                    end
+
+                    if not try_native_tray_menu(current, x, y, cl, gen) then
+                        show_fallback(current, cl, x, y)
+                    end
+                end)
+                return
+            end
+
+            if try_dbus_menu(current, x, y) then
+                embed_busy = false
+                return
+            end
+
+            if try_native_tray_menu(current, x, y, cl, gen) then
+                return
+            end
+
+            show_fallback(current, cl, x, y)
+        end)
+
+        if not ok then
             embed_busy = false
-            return
+            tray_log.info("show " .. current.id .. " error: " .. tostring(err))
+            show_fallback(current, cl, x, y)
         end
-
-        if try_native_tray_menu(item, x, y, cl, gen) then
-            return
-        end
-
-        show_fallback(item, cl, x, y)
-    end)
-
-    if not ok then
-        embed_busy = false
-        tray_log.info("show " .. item.id .. " error: " .. tostring(err))
-        show_fallback(item, cl, x, y)
     end
+
+    if item.service and not item._enriched then
+        gears.timer.start_new(0, run_show)
+        return
+    end
+
+    run_show()
 end
 
 return M

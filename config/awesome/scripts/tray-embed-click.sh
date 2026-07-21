@@ -45,10 +45,11 @@ find_embed_by_index() {
         eval "$(xdotool getwindowgeometry --shell "$wid" 2>/dev/null)" || continue
         sorted+=("$X:$wid")
     done < <(
-        {
-            xdotool search --onlyvisible --name "." 2>/dev/null || true
-            xdotool search --name "." 2>/dev/null || true
-        } | sort -u
+        timeout 2 bash -c '
+            xprop -root _NET_CLIENT_LIST 2>/dev/null | grep -oE "0x[0-9a-fA-F]+" || true
+            xdotool search --class snixembed 2>/dev/null || true
+            xdotool search --class Snixembed 2>/dev/null || true
+        ' 2>/dev/null | sort -u
     )
 
     if ((${#sorted[@]} == 0)); then
@@ -83,10 +84,11 @@ find_embed_at_point() {
             best=$wid
         fi
     done < <(
-        {
-            xdotool search --onlyvisible --name "." 2>/dev/null || true
-            xdotool search --name "." 2>/dev/null || true
-        } | sort -u
+        timeout 2 bash -c '
+            xprop -root _NET_CLIENT_LIST 2>/dev/null | grep -oE "0x[0-9a-fA-F]+" || true
+            xdotool search --class snixembed 2>/dev/null || true
+            xdotool search --class Snixembed 2>/dev/null || true
+        ' 2>/dev/null | sort -u
     )
 
     if [[ -n "$best" && "$best_dist" -le $((72 * 72)) ]]; then

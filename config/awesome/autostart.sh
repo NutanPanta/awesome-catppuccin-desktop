@@ -99,6 +99,24 @@ fi
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
 
+# Keep a single polybar instance and watchdog across Awesome reloads.
+if [[ -r "$HOME/.config/polybar/polybar-ensure.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "$HOME/.config/polybar/polybar-ensure.sh"
+    polybar_cleanup_legacy_watchdogs
+    polybar_cleanup_excess || true
+
+    if ! polybar_is_healthy "$(polybar_expected_count)" \
+        && [[ -x "$HOME/.config/polybar/launch.sh" ]]; then
+        "$HOME/.config/polybar/launch.sh"
+    fi
+elif [[ -x "$HOME/.config/polybar/launch.sh" ]] \
+    && ! pgrep -u "$USER" -x polybar >/dev/null; then
+    "$HOME/.config/polybar/launch.sh"
+fi
+
+run_once "polybar/watchdog.sh" "$HOME/.config/polybar/watchdog.sh"
+
 # Bridge modern StatusNotifier tray icons into Awesome's XEmbed systray.
 if command -v snixembed &>/dev/null; then
     pkill -u "$USER" -x snixembed 2>/dev/null || true
@@ -115,19 +133,6 @@ if command -v systemctl &>/dev/null; then
         sleep 0.2
     done
 fi
-
-if ! pgrep -u "$USER" -x polybar >/dev/null \
-    && [[ -x "$HOME/.config/polybar/launch.sh" ]]; then
-    "$HOME/.config/polybar/launch.sh"
-fi
-
-run_once "polybar-watchdog-loop" bash -c '
-while sleep 30; do
-    pgrep -u "$USER" -x polybar >/dev/null && continue
-    [[ -x "$HOME/.config/polybar/launch.sh" ]] || continue
-    "$HOME/.config/polybar/launch.sh"
-done
-'
 
 # Single top polybar — apps/taskbar in the center section.
 pkill -u "$USER" -x plank 2>/dev/null || true
