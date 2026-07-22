@@ -101,37 +101,48 @@ export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUN
 
 # Keep a single polybar instance and watchdog across Awesome reloads.
 if [[ -r "$HOME/.config/polybar/polybar-ensure.sh" ]]; then
-    # shellcheck source=/dev/null
-    source "$HOME/.config/polybar/polybar-ensure.sh"
-    polybar_cleanup_legacy_watchdogs
-    polybar_cleanup_excess || true
-
-    if ! polybar_is_healthy "$(polybar_expected_count)" \
-        && [[ -x "$HOME/.config/polybar/launch.sh" ]]; then
-        "$HOME/.config/polybar/launch.sh"
-    fi
+    (
+        # shellcheck source=/dev/null
+        source "$HOME/.config/polybar/polybar-ensure.sh"
+        polybar_cleanup_legacy_watchdogs
+        if ! polybar_is_healthy "$(polybar_expected_count)"; then
+            polybar_cleanup_excess || true
+            if ! polybar_is_healthy "$(polybar_expected_count)" \
+                && [[ -x "$HOME/.config/polybar/launch.sh" ]]; then
+                "$HOME/.config/polybar/launch.sh"
+            fi
+        fi
+    ) &
 elif [[ -x "$HOME/.config/polybar/launch.sh" ]] \
     && ! pgrep -u "$USER" -x polybar >/dev/null; then
-    "$HOME/.config/polybar/launch.sh"
+    "$HOME/.config/polybar/launch.sh" &
 fi
 
 run_once "polybar/watchdog.sh" "$HOME/.config/polybar/watchdog.sh"
 
+# Intel BE200 BT can finish boot in a ghost hci0 state; retry softly after login.
+if [[ -x "$HOME/.config/polybar/scripts/bluetooth-boot-recover.sh" ]]; then
+    run_once "bluetooth-boot-recover" "$HOME/.config/polybar/scripts/bluetooth-boot-recover.sh"
+fi
+
 # Bridge modern StatusNotifier tray icons into Awesome's XEmbed systray.
 if command -v snixembed &>/dev/null; then
-    pkill -u "$USER" -x snixembed 2>/dev/null || true
-    GDK_BACKEND=x11 snixembed --fork
+    if ! pgrep -u "$USER" -x snixembed >/dev/null 2>&1; then
+        GDK_BACKEND=x11 snixembed --fork
+    fi
 else
     command -v dunstify &>/dev/null && dunstify "Desktop" "Install snixembed for tray app menus: sudo pacman -S snixembed"
 fi
 
 if command -v systemctl &>/dev/null; then
-    systemctl --user enable pipewire pipewire-pulse wireplumber 2>/dev/null || true
-    systemctl --user start pipewire pipewire-pulse wireplumber 2>/dev/null || true
-    for _ in {1..15}; do
-        command -v wpctl &>/dev/null && wpctl status &>/dev/null && break
-        sleep 0.2
-    done
+    (
+        systemctl --user enable pipewire pipewire-pulse wireplumber 2>/dev/null || true
+        systemctl --user start pipewire pipewire-pulse wireplumber 2>/dev/null || true
+        for _ in {1..15}; do
+            command -v wpctl &>/dev/null && wpctl status &>/dev/null && break
+            sleep 0.2
+        done
+    ) &
 fi
 
 # Single top polybar — apps/taskbar in the center section.
@@ -140,8 +151,6 @@ pkill -u "$USER" -x plank 2>/dev/null || true
 # WiFi / volume / bluetooth live in polybar — no duplicate tray applets
 pkill -u "$USER" -x nm-applet 2>/dev/null || true
 pkill -u "$USER" -x pasystray 2>/dev/null || true
-pkill -u "$USER" -x blueman-applet 2>/dev/null || true
-pkill -u "$USER" -f "blueman-tray" 2>/dev/null || true
 
 run_once "xfce4-power-manager" xfce4-power-manager
 configure_screen_power

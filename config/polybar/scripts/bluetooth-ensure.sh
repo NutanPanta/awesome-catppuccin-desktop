@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 # Bring Bluetooth up when the controller is missing or powered off.
+#
+# Recovery order (only when needed):
+#   1. rfkill / ThinkPad radio / power on
+#   2. Ghost hci0: sysfs reset + bluetoothd restart
+#   3. Intel PCIe BT: module reload
+#   4. Intel PCIe BT ghost/error: PCI remove + rescan (fixes BE200 cnvi boot failures)
+#
+# Set BLUETOOTH_ENSURE_SOFT_ONLY=1 to skip step 4 (used at login — avoids a polkit prompt).
 
 notify() {
     command -v dunstify &>/dev/null && dunstify "$1" "$2"
@@ -17,6 +25,31 @@ ghost_hci_present() {
     [[ -e /sys/class/bluetooth/hci0 ]] || return 1
     [[ -r /sys/class/bluetooth/hci0/address ]] && return 1
     return 0
+}
+
+intel_pcie_bt_slot() {
+    local dev uevent slot
+
+    for dev in /sys/bus/pci/devices/*; do
+        [[ -r "$dev/uevent" ]] || continue
+        uevent=$(<"$dev/uevent")
+        if grep -q 'DRIVER=btintel_pcie' <<< "$uevent"; then
+            slot=${dev##*/}
+            echo "$slot"
+            return 0
+        fi
+    done
+
+    for dev in /sys/bus/pci/devices/*; do
+        [[ -r "$dev/class" && -r "$dev/vendor" ]] || continue
+        [[ "$(<"$dev/class")" == "0x0d1100" ]] || continue
+        [[ "$(<"$dev/vendor")" == "0x8086" ]] || continue
+        slot=${dev##*/}
+        echo "$slot"
+        return 0
+    done
+
+    return 1
 }
 
 unblock_bluetooth() {
@@ -81,11 +114,32 @@ reload_bluetooth_modules() {
 
     notify "Bluetooth" "Reloading Intel Bluetooth driver…"
     run_root bash -c '
+        systemctl stop bluetooth
         modprobe -r btintel_pcie btintel 2>/dev/null || true
         modprobe btintel_pcie 2>/dev/null || modprobe btintel 2>/dev/null || modprobe bluetooth
-        systemctl restart bluetooth
+        systemctl start bluetooth
     ' || return 1
     sleep 3
+}
+
+pci_rescan_intel_bluetooth() {
+    local slot
+    slot=$(intel_pcie_bt_slot) || return 1
+
+    notify "Bluetooth" "Resetting Intel Bluetooth hardware…"
+    run_root bash -c "
+        set -e
+        systemctl stop bluetooth
+        modprobe -r btintel_pcie btintel 2>/dev/null || true
+        echo 1 > /sys/bus/pci/devices/${slot}/remove
+        sleep 1
+        echo 1 > /sys/bus/pci/rescan
+        sleep 2
+        modprobe btintel_pcie
+        sleep 2
+        systemctl start bluetooth
+    " || return 1
+    sleep 2
 }
 
 power_on_controller() {
@@ -97,12 +151,28 @@ recover_ghost_hci() {
     ghost_hci_present || return 1
 
     enable_thinkpad_bluetooth || true
-    reset_hci_controller || return 1
+    reset_hci_controller || true
     restart_bluetooth_service || true
     unblock_bluetooth
     power_on_controller
+    controller_powered && return 0
 
-    controller_powered
+    reload_bluetooth_modules || true
+    unblock_bluetooth
+    power_on_controller
+    controller_powered && return 0
+    ! ghost_hci_present && controller_ready && return 0
+
+    if [[ "${BLUETOOTH_ENSURE_SOFT_ONLY:-0}" == 1 ]]; then
+        return 1
+    fi
+
+    intel_pcie_bt_slot &>/dev/null || return 1
+    pci_rescan_intel_bluetooth || return 1
+    unblock_bluetooth
+    power_on_controller
+
+    controller_powered || controller_ready
 }
 
 ensure_bluetooth() {
@@ -161,7 +231,22 @@ ensure_bluetooth() {
         return 0
     fi
 
-    notify "Bluetooth" "Bluetooth adapter failed to start. Try: sudo bash ~/.config/polybar/scripts/bluetooth-ensure.sh"
+    if ghost_hci_present && [[ "${BLUETOOTH_ENSURE_SOFT_ONLY:-0}" != 1 ]]; then
+        if pci_rescan_intel_bluetooth; then
+            unblock_bluetooth
+            power_on_controller
+            if controller_powered; then
+                notify "Bluetooth" "Bluetooth recovered."
+                return 0
+            fi
+        fi
+    fi
+
+    if ghost_hci_present; then
+        notify "Bluetooth" "Bluetooth adapter is stuck. Click the bar icon again and approve the admin prompt."
+    else
+        notify "Bluetooth" "Bluetooth adapter failed to start. Try: sudo bash ~/.config/polybar/scripts/bluetooth-ensure.sh"
+    fi
     return 1
 }
 

@@ -555,8 +555,28 @@ local function try_dbus_menu_async(item, x, y, gen, callback)
     end)
 end
 
+local function menu_item_label(item, cl)
+    local candidates = {
+        item and item.title,
+        item and item.id_prop,
+        item and item.id and item.id:gsub("-", " "),
+        item and item.wm_class,
+        cl and cl.name,
+    }
+    for _, value in ipairs(candidates) do
+        if type(value) == "string" then
+            value = value:gsub("^%s+", ""):gsub("%s+$", "")
+            value = value:gsub('^"(.*)"$', "%1")
+            if value ~= "" and value:match("%S") then
+                return value
+            end
+        end
+    end
+    return "App"
+end
+
 local function show_fallback(item, cl, x, y)
-    local label = item.title or item.id
+    local label = menu_item_label(item, cl)
     show_menu({
         {
             label = "Open " .. label,
@@ -596,29 +616,35 @@ end
 local function finish_native_tray_menu(item, x, y, cl, gen, native_ok)
     local pill = require("taskbar-pill")
 
-    local function done()
+    local function restore_host()
         if gen ~= menu_generation then
             return
         end
         pill.restore_tray_host()
-        embed_busy = false
     end
 
     if native_ok then
+        embed_busy = false
         tray_log.info("tray " .. item.id .. ": native menu triggered")
-        gears.timer.start_new(8, done)
+        gears.timer.start_new(3, restore_host)
         return
     end
 
-    done()
+    embed_busy = false
+    restore_host()
     tray_log.info("tray " .. item.id .. ": no native menu, showing fallback")
     show_fallback(item, cl, x, y)
 end
 
 local function try_native_tray_menu(item, x, y, cl, gen)
     if embed_busy then
-        tray_log.info("tray " .. item.id .. ": busy, using fallback")
-        show_fallback(item, cl, x, y)
+        tray_log.info("tray " .. item.id .. ": busy, retrying native menu")
+        gears.timer.start_new(0.15, function()
+            if gen ~= menu_generation then
+                return
+            end
+            try_native_tray_menu(item, x, y, cl, gen)
+        end)
         return true
     end
 
@@ -690,7 +716,7 @@ function M.show(item, cl, x, y)
     tray_log.info(string.format("show %s at %d,%d", item.id, x, y))
 
     local function run_show()
-        local current = item
+        local current = tray_registry.attach_embed_metadata(item) or item
         if current.service and not current._enriched then
             current = tray_registry.enrich_item(current) or current
         end
@@ -735,6 +761,59 @@ function M.show(item, cl, x, y)
     end
 
     run_show()
+end
+
+local function sni_has_menu(item)
+    if not item.service or not item.sni_path then
+        return false
+    end
+
+    for _, method in ipairs(sni_menu_methods) do
+        local ok = shell_ok(string.format(
+            "%sgdbus call --session -d %q -o %q -m %s -- 0 0",
+            dbus_env_prefix(),
+            item.service,
+            item.sni_path,
+            method
+        ), "sni-probe " .. item.id, 2)
+        if ok then
+            return true
+        end
+    end
+
+    return false
+end
+
+function M.inspect_menu(item)
+    if not item then
+        return "missing", 0
+    end
+
+    local current = item
+    current = tray_registry.attach_embed_metadata(current) or current
+    if current.service and not current._enriched then
+        current = tray_registry.enrich_item(current) or current
+    end
+
+    if current.menu_path and current.service then
+        local out = shell_output(dbus_get_layout_cmd(current), GDBUS_TIMEOUT_S + 1)
+        if out and out ~= "" and not out:find("Usage:", 1, true) then
+            local entries = parse_dbusmenu_layout(out)
+            if #entries > 0 then
+                return "dbus", #entries
+            end
+        end
+    end
+
+    if current.systray_index ~= nil then
+        return "embed", current.systray_index
+    end
+
+    if sni_has_menu(current) then
+        return "sni", 0
+    end
+
+    return "fallback", 0
 end
 
 return M

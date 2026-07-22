@@ -36,7 +36,19 @@ local function parse_bus_string(output)
 end
 
 local function resolve_tray_icon_file(theme_path, icon_name)
-    if not theme_path or theme_path == "" or not icon_name or icon_name == "" then
+    if not icon_name or icon_name == "" then
+        return nil
+    end
+
+    if icon_name:sub(1, 1) == "/" then
+        local handle = io.open(icon_name, "r")
+        if handle then
+            handle:close()
+            return icon_name
+        end
+    end
+
+    if not theme_path or theme_path == "" then
         return nil
     end
 
@@ -86,6 +98,7 @@ local function live_tray_icon(item, force)
     end
 
     local path = resolve_tray_icon_file(theme_path, icon_name)
+        or tray_registry.lookup_icon_name(icon_name, theme_path)
     if path then
         item.icon_name = icon_name
         item.icon_path = path
@@ -187,8 +200,17 @@ local fallback_icons = {
     slack = "󰒱",
     discord = "󰙯",
     telegram = "󰚇",
+    telegramdesktop = "󰚇",
+    ["org-telegram-desktop"] = "󰚇",
+    viber = "󰖴",
+    viberpc = "󰖴",
     hubstaff = "󰄉",
     ["netsoft-com.netsoft.hubstaff"] = "󰄉",
+    blueman = "󰂯",
+    ["proton-vpn"] = "󰖂",
+    protonvpn = "󰖂",
+    ["proton-vpn-app-gtk"] = "󰖂",
+    ["protonvpn-app"] = "󰖂",
 }
 
 local icon_aliases = {
@@ -197,6 +219,8 @@ local icon_aliases = {
     ["pgadmin-4"] = "pgadmin4",
     viber = "viber",
     viberpc = "viber",
+    telegramdesktop = "org.telegram.desktop",
+    telegram = "org.telegram.desktop",
 }
 
 local function client_icon_candidates(cl)
@@ -229,7 +253,17 @@ local function client_icon_candidates(cl)
     return candidates
 end
 
+local function client_has_wm_icon(cl)
+    return cl.icon_sizes and #cl.icon_sizes > 0
+end
+
 local function lookup_app_icon(cl)
+    -- Real windows ship a WM icon; prefer it over theme lookup (which can
+    -- pick the wrong app when names/tokens overlap, e.g. Chrome vs Proton VPN).
+    if client_has_wm_icon(cl) then
+        return nil
+    end
+
     for _, name in ipairs(client_icon_candidates(cl)) do
         local path = menubar_utils.lookup_icon_uncached(name)
         if path and path ~= false then
@@ -238,8 +272,58 @@ local function lookup_app_icon(cl)
     end
 end
 
-local function client_has_wm_icon(cl)
-    return cl.icon_sizes and #cl.icon_sizes > 0
+local function lookup_tray_theme_icon(cl)
+    local item = tray_registry.match_client(cl, false)
+    if not item then
+        return nil
+    end
+    return live_tray_icon(item) or item.icon_path
+end
+
+local function resolve_tray_item_icon(item)
+    if not item then
+        return nil
+    end
+    local path = live_tray_icon(item, true)
+    if path and path ~= "" then
+        return path
+    end
+    return tray_registry.resolve_item_icon(item, true)
+end
+
+local function resolve_client_theme_icon(cl)
+    return lookup_tray_theme_icon(cl) or lookup_app_icon(cl)
+end
+
+local function load_icon_surface(path, size)
+    size = size or ICON
+    if not path or path == "" or path == false then
+        return nil
+    end
+
+    local surface = gears.surface.load(path, false)
+    if surface then
+        return surface
+    end
+
+    if not path:lower():match("%.svg$") then
+        return nil
+    end
+
+    local ok, lgi = pcall(require, "lgi")
+    if not ok then
+        return nil
+    end
+
+    local handle = lgi.Rsvg.Handle.new_from_file(path)
+    if not handle then
+        return nil
+    end
+
+    local surface = lgi.cairo.ImageSurface.create(lgi.cairo.Format.ARGB32, size, size)
+    local cr = lgi.cairo.Context.create(surface)
+    handle:render_cairo(cr)
+    return surface
 end
 
 local function icon_for(cl)
@@ -287,17 +371,29 @@ end
 
 local function label_for_tray(item, cl, entry)
     return first_label(
-        cl and cl.name,
-        entry and entry.name,
         item and item.title,
         item and item.id_prop,
         item and item.id and item.id:gsub("-", " "),
-        item and item.wm_class and prettify_class(item.wm_class)
+        item and item.wm_class and prettify_class(item.wm_class),
+        entry and entry.name,
+        cl and cl.name
     ) or "App"
 end
 
 local function tooltip_text(text)
     return clean_label(text) or "App"
+end
+
+local function tray_nerd_icon(item, entry)
+    local id = (item.id_prop or item.id or ""):lower()
+    local token = id:match("^(%w+)_status_icon") or id:match("^(%w+)%-status%-icon")
+    return fallback_icons[item.id]
+        or fallback_icons[id]
+        or (token and fallback_icons[token])
+        or fallback_icons[id:match("^(%w+)")]
+        or fallback_icons[id:match("(%w+)")]
+        or (entry and entry.nerd_icon)
+        or "󰖟"
 end
 
 local function is_tray_app(cl)
@@ -328,7 +424,7 @@ local skip = {
     awesome = true,
     picom = true,
     xfdesktop = true,
-    pavucontrol = true,
+    ["blueman-manager"] = true,
 }
 
 local function include_client(cl, fast)
@@ -487,14 +583,16 @@ end
 
 local function build_icon_widget(theme_icon, nerd_icon, cl)
     if theme_icon then
-        local surface = gears.surface.load(theme_icon, false)
-        return wibox.widget {
-            image = surface or theme_icon,
-            forced_width = ICON,
-            forced_height = ICON,
-            resize = true,
-            widget = wibox.widget.imagebox,
-        }
+        local surface = load_icon_surface(theme_icon)
+        if surface then
+            return wibox.widget {
+                image = surface,
+                forced_width = ICON,
+                forced_height = ICON,
+                resize = true,
+                widget = wibox.widget.imagebox,
+            }
+        end
     end
 
     if cl and client_has_wm_icon(cl) then
@@ -534,6 +632,7 @@ function M.create(s)
     local place
     local layout_pill
     local refresh_debounce
+    local full_tray_refresh_timer
     local safe_layout_pill
     local safe_refresh_apps
 
@@ -545,8 +644,33 @@ function M.create(s)
         end
     end
 
-    local function schedule_refresh()
+    local function schedule_full_tray_refresh()
+        if full_tray_refresh_timer then
+            full_tray_refresh_timer:again()
+            return
+        end
+        full_tray_refresh_timer = gears.timer {
+            timeout = 2.5,
+            autostart = true,
+            single_shot = true,
+            callback = function()
+                full_tray_refresh_timer = nil
+                if tray_registry.is_refreshing() then
+                    schedule_full_tray_refresh()
+                    return
+                end
+                tray_registry.refresh_async(function()
+                    schedule_refresh()
+                end, true)
+            end,
+        }
+    end
+
+    local function schedule_refresh(rescan_tray)
         if refresh_debounce then
+            if rescan_tray then
+                refresh_debounce.rescan_tray = true
+            end
             refresh_debounce:again()
             return
         end
@@ -554,13 +678,24 @@ function M.create(s)
             timeout = 0.08,
             autostart = true,
             single_shot = true,
+            rescan_tray = rescan_tray == true,
             callback = function()
+                local rescan = refresh_debounce and refresh_debounce.rescan_tray
                 refresh_debounce = nil
-                if safe_refresh_apps then
-                    safe_refresh_apps()
+                local function run_refresh()
+                    if safe_refresh_apps then
+                        safe_refresh_apps()
+                    end
+                    if safe_layout_pill then
+                        safe_layout_pill()
+                    end
                 end
-                if safe_layout_pill then
-                    safe_layout_pill()
+                if rescan and not tray_registry.is_refreshing() then
+                    run_refresh()
+                    tray_registry.refresh_async(run_refresh, false)
+                    schedule_full_tray_refresh()
+                else
+                    run_refresh()
                 end
             end,
         }
@@ -581,17 +716,8 @@ function M.create(s)
     pill_refreshers[s.index] = schedule_refresh
     ensure_hidden_tray_host(s)
 
-    local function remember_tray_client(cl, item)
-        local entry = tracked[item.id] or {}
-        entry.name = label_for_tray(item, cl, entry)
-        entry.theme_icon = item.icon_path or lookup_app_icon(cl) or entry.theme_icon
-        entry.nerd_icon = icon_for(cl)
-        entry.item = item
-        tracked[item.id] = entry
-    end
-
     local function make_client_item(cl)
-        local icon = build_icon_widget(lookup_app_icon(cl), icon_for(cl), cl)
+        local icon = build_icon_widget(resolve_client_theme_icon(cl), icon_for(cl), cl)
         local bg = wibox.widget {
             {
                 icon,
@@ -623,7 +749,7 @@ function M.create(s)
                 end
             end),
             awful.button({}, 3, function()
-                local tray_item = tray_registry.match_client(cl)
+                local tray_item = tray_registry.match_client(cl, false)
                 if tray_item then
                     local coords = mouse.coords()
                     tray_menu.show(tray_item, cl, coords.x, coords.y)
@@ -652,14 +778,13 @@ function M.create(s)
     local function make_tray_item(item, cl)
         local entry = tracked[item.id] or {
             theme_icon = item.icon_path,
-            nerd_icon = (cl and icon_for(cl))
-                or fallback_icons[(item.id_prop or item.id or ""):lower():match("^(%w+)")]
-                or "󰖟",
+            nerd_icon = tray_nerd_icon(item, nil),
             item = item,
         }
 
         entry.name = label_for_tray(item, cl, entry)
-        entry.theme_icon = item.icon_path or entry.theme_icon
+        entry.theme_icon = resolve_tray_item_icon(item) or entry.theme_icon
+        entry.nerd_icon = tray_nerd_icon(item, entry)
         entry.item = item
         tracked[item.id] = entry
 
@@ -667,7 +792,7 @@ function M.create(s)
         local icon = build_icon_widget(
             entry.theme_icon,
             entry.nerd_icon,
-            entry.theme_icon and nil or cl
+            (not entry.theme_icon and has_window) and cl or nil
         )
         local bg_color = has_window and ((cl == client.focus) and c.mauve or c.surface1) or c.mantle
 
@@ -743,60 +868,59 @@ function M.create(s)
 
     local function refresh_apps()
         local items = {}
-        local tray_with_window = {}
+        local matched_tray_ids = {}
+        local shown_tray_only = {}
         highlight_widgets = {}
 
         local tray_items = tray_registry.cached_items()
-        if #tray_items == 0 then
-            if not tray_registry.is_refreshing() then
-                tray_registry.refresh_async(function()
-                    schedule_refresh()
-                end)
-            end
-        else
-            tray_items = tray_registry.list()
+        if tray_registry.is_stale() and not tray_registry.is_refreshing() then
+            tray_registry.refresh_async(function()
+                schedule_refresh()
+            end, false)
+            schedule_full_tray_refresh()
         end
         tray_registry.set_match_items(tray_items)
 
-        local clients = client.get()
-        for _, cl in ipairs(clients) do
-            if include_client(cl) then
-                items[#items + 1] = make_client_item(cl)
+        for _, cl in ipairs(client.get()) do
+            if not include_client(cl, true) then
+                goto continue_client
             end
-        end
 
-        for _, cl in ipairs(clients) do
-            local item = tray_registry.match_client(cl)
+            local item = tray_registry.match_client(cl, false)
             if item then
-                remember_tray_client(cl, item)
-                tray_with_window[item.id] = cl
-                local widget = make_tray_item(item, cl)
-                if widget then
-                    items[#items + 1] = widget
-                end
+                matched_tray_ids[item.id] = true
             end
+            items[#items + 1] = make_client_item(cl)
+            ::continue_client::
         end
 
         for _, item in ipairs(tray_items) do
-            if not tray_with_window[item.id] and tray_registry.is_running(item) then
-                tracked[item.id] = tracked[item.id] or {
-                    nerd_icon = fallback_icons[item.id]
-                        or fallback_icons[(item.id_prop or ""):lower():match("^(%w+)")]
-                        or "󰖟",
-                }
-                tracked[item.id].name = label_for_tray(item, nil, tracked[item.id])
-                tracked[item.id].theme_icon = item.icon_path
-                tracked[item.id].item = item
-                if item.icon_path then
-                    last_tray_icons[item.id] = item.icon_path
-                end
-                local widget = make_tray_item(item, nil)
-                if widget then
-                    items[#items + 1] = widget
-                end
-            elseif not tray_registry.is_running(item) then
-                tracked[item.id] = nil
+            if matched_tray_ids[item.id] then
+                goto continue_tray
             end
+
+            for _, shown in ipairs(shown_tray_only) do
+                if tray_registry.items_relate(item, shown) then
+                    goto continue_tray
+                end
+            end
+
+            if not tray_registry.show_tray_only(item) then
+                tracked[item.id] = nil
+                goto continue_tray
+            end
+
+            tracked[item.id] = tracked[item.id] or {}
+            tracked[item.id].nerd_icon = tray_nerd_icon(item, tracked[item.id])
+            tracked[item.id].name = label_for_tray(item, nil, tracked[item.id])
+            tracked[item.id].theme_icon = resolve_tray_item_icon(item)
+            tracked[item.id].item = item
+            if tracked[item.id].theme_icon then
+                last_tray_icons[item.id] = tracked[item.id].theme_icon
+            end
+            shown_tray_only[#shown_tray_only + 1] = item
+            items[#items + 1] = make_tray_item(item, nil)
+            ::continue_tray::
         end
 
         tray_registry.set_match_items(nil)
@@ -889,7 +1013,8 @@ function M.create(s)
                         if safe_layout_pill then
                             safe_layout_pill()
                         end
-                    end)
+                    end, false)
+                    schedule_full_tray_refresh()
                 end
             end)
             return
@@ -917,14 +1042,23 @@ function M.create(s)
         }
     end
 
-    local function on_client_list_change()
-        schedule_refresh()
+    local function on_client_list_change(rescan_tray)
+        schedule_refresh(rescan_tray)
     end
 
     s:connect_signal("property::workarea", schedule_layout)
     s:connect_signal("property::geometry", schedule_layout)
-    client.connect_signal("manage", on_client_list_change)
-    client.connect_signal("unmanage", on_client_list_change)
+    client.connect_signal("manage", function()
+        on_client_list_change(true)
+    end)
+    client.connect_signal("unmanage", function()
+        on_client_list_change(true)
+        if not tray_registry.is_refreshing() then
+            tray_registry.refresh_async(function()
+                schedule_refresh()
+            end, false)
+        end
+    end)
     client.connect_signal("focus", update_focus_highlights)
     client.connect_signal("property::minimized", on_client_list_change)
     client.connect_signal("property::class", on_client_list_change)
