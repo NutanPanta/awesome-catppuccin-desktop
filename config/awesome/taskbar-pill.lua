@@ -207,6 +207,7 @@ local fallback_icons = {
     hubstaff = "󰄉",
     ["netsoft-com.netsoft.hubstaff"] = "󰄉",
     blueman = "󰂯",
+    flameshot = "󰄀",
     ["proton-vpn"] = "󰖂",
     protonvpn = "󰖂",
     ["proton-vpn-app-gtk"] = "󰖂",

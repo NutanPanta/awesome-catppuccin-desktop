@@ -9,11 +9,17 @@ polybar_expected_count() {
 }
 
 polybar_running_count() {
-    pgrep -c -u "${USER}" -x polybar 2>/dev/null || echo 0
+    local count
+    count=$(pgrep -c -u "${USER}" -x polybar 2>/dev/null) || true
+    count=${count:-0}
+    echo "$count"
 }
 
 polybar_window_count() {
-    xdotool search --class polybar 2>/dev/null | wc -l
+    local count
+    count=$(xdotool search --class polybar 2>/dev/null | wc -l | tr -d '[:space:]')
+    count=${count:-0}
+    echo "$count"
 }
 
 polybar_cleanup_windows() {
@@ -78,9 +84,14 @@ polybar_cleanup_legacy_watchdogs() {
     pkill -u "${USER}" -f "polybar-watchdog-loop" 2>/dev/null || true
     pkill -u "${USER}" -f "awesome-polybar-watchdog" 2>/dev/null || true
 
-    while (( $(pgrep -u "${USER}" -fc "[p]olybar/watchdog.sh" 2>/dev/null || echo 0) > 1 )); do
+    local watchdog_count
+    watchdog_count=$(pgrep -u "${USER}" -fc "[p]olybar/watchdog.sh" 2>/dev/null) || true
+    watchdog_count=${watchdog_count:-0}
+    while (( watchdog_count > 1 )); do
         pkill -u "${USER}" -f "polybar/watchdog.sh" 2>/dev/null || true
         sleep 0.2
+        watchdog_count=$(pgrep -u "${USER}" -fc "[p]olybar/watchdog.sh" 2>/dev/null) || true
+        watchdog_count=${watchdog_count:-0}
     done
 }
 

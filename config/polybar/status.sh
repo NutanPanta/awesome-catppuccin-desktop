@@ -2,12 +2,14 @@
 
 export DISPLAY="${DISPLAY:-:0}"
 
-expected=$(polybar --list-monitors 2>/dev/null | wc -l)
-(( expected == 0 )) && expected=1
+# shellcheck source=polybar-ensure.sh
+source "${HOME}/.config/polybar/polybar-ensure.sh"
+
+expected=$(polybar_expected_count)
 
 for _ in {1..50}; do
-    procs=$(pgrep -c -x polybar 2>/dev/null || echo 0)
-    windows=$(xdotool search --class polybar 2>/dev/null | wc -l)
+    procs=$(polybar_running_count)
+    windows=$(polybar_window_count)
 
     if (( procs == expected && windows == expected )); then
         break
@@ -21,8 +23,8 @@ for _ in {1..50}; do
     sleep 0.1
 done
 
-procs=$(pgrep -c -x polybar 2>/dev/null || echo 0)
-windows=$(xdotool search --class polybar 2>/dev/null | wc -l)
+procs=$(polybar_running_count)
+windows=$(polybar_window_count)
 
 echo "polybar processes: ${procs}"
 echo "polybar windows:   ${windows}"

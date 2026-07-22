@@ -28,7 +28,6 @@ local SYSTEM_TRAY_IDS = {
     chromium = true,
     thunar = true,
     bamfdaemon = true,
-    flameshot = true,
 }
 
 local SKIP_ID_PATTERNS = {

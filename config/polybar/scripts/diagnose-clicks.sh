@@ -13,7 +13,9 @@ section "Polybar process / window count"
 if [[ -x "${HOME}/.config/polybar/status.sh" ]]; then
     "${HOME}/.config/polybar/status.sh" || true
 else
-    echo "polybar processes: $(pgrep -c -x polybar 2>/dev/null || echo 0)"
+    procs=$(pgrep -c -x polybar 2>/dev/null) || true
+    procs=${procs:-0}
+    echo "polybar processes: ${procs}"
     echo "polybar windows:   $(xdotool search --class polybar 2>/dev/null | wc -l)"
 fi
 
