@@ -270,6 +270,17 @@ awful.rules.rules = {
         }
     },
     {
+        rule_any = {
+            class = {
+                "google-chrome", "Google-chrome", "Chromium", "chromium",
+                "Firefox", "firefox", "code", "Code", "cursor", "Cursor",
+                "kitty", "Kitty", "Alacritty", "alacritty", "WezTerm", "wezterm",
+            },
+            type = { "desktop", "dock", "splash", "utility", "notification", "toolbar" },
+        },
+        properties = { titlebars_enabled = false },
+    },
+    {
         rule = { class = "Polybar" },
         properties = {
             border_width = 0,

@@ -53,6 +53,8 @@ local bad_services = {}
 local refresh_inflight = false
 local refresh_pending_callbacks = {}
 local refresh_pending_full = false
+local running_cache = {}
+local RUNNING_CACHE_TTL = 5
 
 local BUSCTL_TIMEOUT_S = 1
 local BAD_SERVICE_TTL_S = 180
@@ -272,7 +274,66 @@ local TRAY_ICON_ALIASES = {
     ["proton-vpn-app-gtk"] = "proton-vpn-logo",
     ["protonvpn-app"] = "proton-vpn-logo",
     ["proton.vpn.app.gtk"] = "proton-vpn-logo",
+    flameshot = "org.flameshot.Flameshot",
 }
+
+local FS_ICON_DIRS = {
+    "/usr/share/icons/hicolor",
+    (os.getenv("HOME") or "") .. "/.local/share/icons/hicolor",
+}
+local FS_ICON_SIZES = { "scalable", "48x48", "32x32", "24x24", "22x22", "16x16", "128x128" }
+local FS_ICON_EXTS = { "svg", "png" }
+
+local function icon_name_candidates(name)
+    if not name or name == "" then
+        return {}
+    end
+
+    local seen = {}
+    local out = {}
+    local function add(value)
+        if value and value ~= "" then
+            value = value:lower()
+            if not seen[value] then
+                seen[value] = true
+                out[#out + 1] = value
+            end
+        end
+    end
+
+    add(name)
+    local stem = name:gsub("%-symbolic$", "")
+    if stem ~= name then
+        add(stem)
+    end
+    if name:find("%.") then
+        add(name:match("([^%.]+)$"))
+    end
+
+    local alias = TRAY_ICON_ALIASES[name:lower()] or TRAY_ICON_ALIASES[stem:lower()]
+    if alias then
+        add(alias)
+    end
+
+    return out
+end
+
+local function lookup_filesystem_icon(name)
+    for _, candidate in ipairs(icon_name_candidates(name)) do
+        for _, root in ipairs(FS_ICON_DIRS) do
+            if root and root ~= "" then
+                for _, size in ipairs(FS_ICON_SIZES) do
+                    for _, ext in ipairs(FS_ICON_EXTS) do
+                        local path = string.format("%s/%s/apps/%s.%s", root, size, candidate, ext)
+                        if file_exists(path) then
+                            return path
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
 
 local function lookup_icon_name(icon_name, theme_path)
     if not icon_name or icon_name == "" then
@@ -300,6 +361,10 @@ local function lookup_icon_name(icon_name, theme_path)
     for _, name in ipairs(candidates) do
         local found = menubar_utils.lookup_icon_uncached(name)
         if found and found ~= false then
+            return found
+        end
+        found = lookup_filesystem_icon(name)
+        if found then
             return found
         end
     end
@@ -390,6 +455,10 @@ local function lookup_item_icon(item)
             local alias = TRAY_ICON_ALIASES[name:lower()] or name:lower()
             local path = menubar_utils.lookup_icon_uncached(alias)
             if path and path ~= false then
+                return path
+            end
+            path = lookup_filesystem_icon(name)
+            if path then
                 return path
             end
         end
@@ -1679,21 +1748,35 @@ function M.is_running(item)
     if not item then
         return false
     end
-    if item.service and service_on_bus(item.service) then
-        return true
-    end
 
-    for _, scan in ipairs(cache.scan) do
-        if class_matches(item, scan.secondary) or class_matches(item, scan.primary) then
-            return true
+    local cache_key = item.id or item.service or item.id_prop
+    if cache_key then
+        local cached = running_cache[cache_key]
+        if cached and os.time() - cached.at < RUNNING_CACHE_TTL then
+            return cached.value
         end
     end
 
-    if item.id_prop then
-        return shell_output("pgrep -fi " .. item.id_prop .. " | head -1") ~= ""
+    local result = false
+    if item.service and service_on_bus(item.service) then
+        result = true
+    else
+        for _, scan in ipairs(cache.scan) do
+            if class_matches(item, scan.secondary) or class_matches(item, scan.primary) then
+                result = true
+                break
+            end
+        end
+
+        if not result and item.id_prop then
+            result = shell_output("pgrep -fx " .. item.id_prop .. " | head -1") ~= ""
+        end
     end
 
-    return false
+    if cache_key then
+        running_cache[cache_key] = { at = os.time(), value = result }
+    end
+    return result
 end
 
 function M.show_tray_only(item)

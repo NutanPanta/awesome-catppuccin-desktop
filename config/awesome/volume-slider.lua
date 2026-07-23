@@ -101,6 +101,11 @@ function M.create(s)
         widget = wibox.widget.slider,
     }
 
+    local mute_label = wibox.widget {
+        markup = string.format('<span foreground="%s">Mute</span>', c.text),
+        widget = wibox.widget.textbox,
+    }
+
     slider:connect_signal("property::value", function()
         if state.updating then
             return
@@ -114,11 +119,6 @@ function M.create(s)
             c.text
         ))
     end)
-
-    local mute_label = wibox.widget {
-        markup = string.format('<span foreground="%s">Mute</span>', c.text),
-        widget = wibox.widget.textbox,
-    }
 
     local mute_btn = wibox.widget {
         {
@@ -301,7 +301,17 @@ function M.create(s)
 
             place()
             popup.visible = true
-            start_grabbers()
+            if popup.raise then
+                popup:raise()
+            end
+
+            -- Opening click lands on polybar; delay grabber so we do not instantly dismiss.
+            gears.timer.start_new(0.2, function()
+                if popup.visible then
+                    start_grabbers()
+                end
+                return false
+            end)
         end)
     end
 

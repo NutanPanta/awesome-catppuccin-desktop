@@ -14,26 +14,8 @@ local M = {}
 local systray_widget
 local pill_refreshers = {}
 local last_tray_icons = {}
-local live_icon_cache = {}
 
 local ICON = 22
-
-local function shell_line(cmd)
-    local handle = io.popen(cmd .. " 2>/dev/null")
-    if not handle then
-        return ""
-    end
-    local out = handle:read("*a") or ""
-    handle:close()
-    return out:gsub("^%s+", ""):gsub("%s+$", "")
-end
-
-local function parse_bus_string(output)
-    if not output or output == "" then
-        return nil
-    end
-    return output:match('^%S+%s+"([^"]+)"') or output:match("^%S+%s+(%S+)")
-end
 
 local function resolve_tray_icon_file(theme_path, icon_name)
     if not icon_name or icon_name == "" then
@@ -68,46 +50,30 @@ local function resolve_tray_icon_file(theme_path, icon_name)
     end
 end
 
-local function live_tray_icon(item, force)
+local function live_tray_icon(item)
     if not item then
         return nil
     end
 
-    if not item.service or not item.sni_path then
+    if item.icon_path and item.icon_path ~= "" then
         return item.icon_path
     end
 
-    local cache_key = item.service .. item.sni_path
-    local icon_name = parse_bus_string(shell_line(string.format(
-        "busctl --user get-property %q %q org.kde.StatusNotifierItem IconName",
-        item.service,
-        item.sni_path
-    )))
-    local theme_path = parse_bus_string(shell_line(string.format(
-        "busctl --user get-property %q %q org.kde.StatusNotifierItem IconThemePath",
-        item.service,
-        item.sni_path
-    )))
-    local icon_key = (icon_name or "") .. "|" .. (theme_path or "")
-    local cached = live_icon_cache[cache_key]
-
-    if not force and cached and cached.icon_key == icon_key then
-        item.icon_name = cached.icon_name
-        item.icon_path = cached.icon_path
-        return cached.icon_path
+    local path = tray_registry.resolve_item_icon(item, false)
+    if path and path ~= "" then
+        item.icon_path = path
+        return path
     end
 
-    local path = resolve_tray_icon_file(theme_path, icon_name)
-        or tray_registry.lookup_icon_name(icon_name, theme_path)
-    if path then
-        item.icon_name = icon_name
-        item.icon_path = path
-        live_icon_cache[cache_key] = {
-            icon_key = icon_key,
-            icon_name = icon_name,
-            icon_path = path,
-        }
-        return path
+    local icon_name = item.icon_name
+    local theme_path = item.icon_theme_path
+    if icon_name and icon_name ~= "" then
+        local path = resolve_tray_icon_file(theme_path, icon_name)
+            or tray_registry.lookup_icon_name(icon_name, theme_path)
+        if path then
+            item.icon_path = path
+            return path
+        end
     end
 
     return item.icon_path
@@ -119,10 +85,9 @@ local function poll_tray_icons()
         return false
     end
 
-    local changed = tray_registry.refresh_icons()
-
+    local changed = false
     for _, item in ipairs(items) do
-        local path = live_tray_icon(item, true)
+        local path = item.icon_path
         if path and last_tray_icons[item.id] ~= path then
             last_tray_icons[item.id] = path
             changed = true
@@ -136,6 +101,25 @@ local function poll_tray_icons()
     end
 
     return changed
+end
+
+local function schedule_systray_refresh()
+    if M._systray_refresh_pending then
+        return
+    end
+    M._systray_refresh_pending = true
+    gears.timer.start_new(0.6, function()
+        M._systray_refresh_pending = false
+        if tray_registry.is_refreshing() then
+            schedule_systray_refresh()
+            return
+        end
+        tray_registry.refresh_async(function()
+            for _, refresh in pairs(pill_refreshers) do
+                refresh()
+            end
+        end, false)
+    end)
 end
 
 local function stop_pill_timers()
@@ -285,11 +269,11 @@ local function resolve_tray_item_icon(item)
     if not item then
         return nil
     end
-    local path = live_tray_icon(item, true)
+    local path = live_tray_icon(item)
     if path and path ~= "" then
         return path
     end
-    return tray_registry.resolve_item_icon(item, true)
+    return tray_registry.resolve_item_icon(item, false)
 end
 
 local function resolve_client_theme_icon(cl)
@@ -459,18 +443,7 @@ local function ensure_systray(s)
         systray_widget:set_base_size(ICON)
 
         if not M._systray_connected then
-            awesome.connect_signal("systray::update", function()
-                if not M._systray_refresh_pending then
-                    M._systray_refresh_pending = true
-                    gears.timer.start_new(0.3, function()
-                        M._systray_refresh_pending = false
-                        safe_poll_tray_icons()
-                        for _, refresh in pairs(pill_refreshers) do
-                            refresh()
-                        end
-                    end)
-                end
-            end)
+            awesome.connect_signal("systray::update", schedule_systray_refresh)
             M._systray_connected = true
         end
     end
@@ -692,9 +665,8 @@ function M.create(s)
                     end
                 end
                 if rescan and not tray_registry.is_refreshing() then
-                    run_refresh()
+                    refresh_clients_only()
                     tray_registry.refresh_async(run_refresh, false)
-                    schedule_full_tray_refresh()
                 else
                     run_refresh()
                 end
@@ -878,7 +850,6 @@ function M.create(s)
             tray_registry.refresh_async(function()
                 schedule_refresh()
             end, false)
-            schedule_full_tray_refresh()
         end
         tray_registry.set_match_items(tray_items)
 
@@ -1050,20 +1021,21 @@ function M.create(s)
     s:connect_signal("property::workarea", schedule_layout)
     s:connect_signal("property::geometry", schedule_layout)
     client.connect_signal("manage", function()
-        on_client_list_change(true)
+        on_client_list_change(false)
     end)
     client.connect_signal("unmanage", function()
-        on_client_list_change(true)
-        if not tray_registry.is_refreshing() then
-            tray_registry.refresh_async(function()
-                schedule_refresh()
-            end, false)
-        end
+        on_client_list_change(false)
     end)
     client.connect_signal("focus", update_focus_highlights)
-    client.connect_signal("property::minimized", on_client_list_change)
-    client.connect_signal("property::class", on_client_list_change)
-    client.connect_signal("property::icon", on_client_list_change)
+    client.connect_signal("property::minimized", function()
+        on_client_list_change(false)
+    end)
+    client.connect_signal("property::class", function()
+        on_client_list_change(true)
+    end)
+    client.connect_signal("property::icon", function()
+        on_client_list_change(false)
+    end)
 end
 
 return M
