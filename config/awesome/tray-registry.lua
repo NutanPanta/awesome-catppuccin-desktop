@@ -260,23 +260,6 @@ local function resolve_theme_icon(theme_path, icon_name)
     end
 end
 
-local TRAY_ICON_ALIASES = {
-    telegram = "org.telegram.desktop",
-    telegramdesktop = "org.telegram.desktop",
-    ["org.telegram.desktop"] = "org.telegram.desktop",
-    ["org.telegram.desktop-symbolic"] = "org.telegram.desktop",
-    ["snap.telegram-desktop"] = "org.telegram.desktop",
-    ["telegram-desktop"] = "org.telegram.desktop",
-    viber = "viber",
-    viberpc = "viber",
-    ["com.viber.viber"] = "viber",
-    ["protonvpn-app"] = "proton-vpn-logo",
-    ["proton-vpn-app-gtk"] = "proton-vpn-logo",
-    ["protonvpn-app"] = "proton-vpn-logo",
-    ["proton.vpn.app.gtk"] = "proton-vpn-logo",
-    flameshot = "org.flameshot.Flameshot",
-}
-
 local FS_ICON_DIRS = {
     "/usr/share/icons/hicolor",
     (os.getenv("HOME") or "") .. "/.local/share/icons/hicolor",
@@ -308,11 +291,6 @@ local function icon_name_candidates(name)
     end
     if name:find("%.") then
         add(name:match("([^%.]+)$"))
-    end
-
-    local alias = TRAY_ICON_ALIASES[name:lower()] or TRAY_ICON_ALIASES[stem:lower()]
-    if alias then
-        add(alias)
     end
 
     return out
@@ -352,10 +330,6 @@ local function lookup_icon_name(icon_name, theme_path)
     end
     if icon_name:find("%.") then
         candidates[#candidates + 1] = icon_name:match("([^%.]+)$"):lower()
-    end
-    local alias = TRAY_ICON_ALIASES[icon_name:lower()] or TRAY_ICON_ALIASES[stem:lower()]
-    if alias then
-        candidates[#candidates + 1] = alias:lower()
     end
 
     for _, name in ipairs(candidates) do
@@ -452,8 +426,7 @@ local function lookup_item_icon(item)
 
     for _, name in ipairs({ item.icon_name, item.id_prop, item.wm_class, item.id, item.title }) do
         if name and name ~= "" then
-            local alias = TRAY_ICON_ALIASES[name:lower()] or name:lower()
-            local path = menubar_utils.lookup_icon_uncached(alias)
+            local path = menubar_utils.lookup_icon_uncached(name:lower())
             if path and path ~= false then
                 return path
             end

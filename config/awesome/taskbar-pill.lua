@@ -167,46 +167,7 @@ local PILL_H = ITEM + 6
 local RADIUS = 14
 local BAR_HEIGHT = 60
 
-local fallback_icons = {
-    ["google-chrome"] = "󰊯",
-    ["google-chrome-stable"] = "󰊯",
-    chromium = "󰊯",
-    firefox = "󰈹",
-    kitty = "󰆍",
-    alacritty = "󰆍",
-    wezterm = "󰆍",
-    thunar = "󰉋",
-    code = "󰨞",
-    ["code-oss"] = "󰨞",
-    cursor = "󰨞",
-    nvim = "󰈮",
-    spotify = "󰓇",
-    slack = "󰒱",
-    discord = "󰙯",
-    telegram = "󰚇",
-    telegramdesktop = "󰚇",
-    ["org-telegram-desktop"] = "󰚇",
-    viber = "󰖴",
-    viberpc = "󰖴",
-    hubstaff = "󰄉",
-    ["netsoft-com.netsoft.hubstaff"] = "󰄉",
-    blueman = "󰂯",
-    flameshot = "󰄀",
-    ["proton-vpn"] = "󰖂",
-    protonvpn = "󰖂",
-    ["proton-vpn-app-gtk"] = "󰖂",
-    ["protonvpn-app"] = "󰖂",
-}
-
-local icon_aliases = {
-    pgadmin4 = "pgadmin4",
-    pgadmin = "pgadmin4",
-    ["pgadmin-4"] = "pgadmin4",
-    viber = "viber",
-    viberpc = "viber",
-    telegramdesktop = "org.telegram.desktop",
-    telegram = "org.telegram.desktop",
-}
+local GENERIC_NERD_ICON = "󰖟"
 
 local function client_icon_candidates(cl)
     local candidates = {}
@@ -225,7 +186,6 @@ local function client_icon_candidates(cl)
     end
 
     local cls = (cl.class or ""):lower()
-    add(icon_aliases[cls])
     add(cls)
     add(cl.instance and cl.instance:lower())
     if cl.startup_id then
@@ -311,8 +271,8 @@ local function load_icon_surface(path, size)
     return surface
 end
 
-local function icon_for(cl)
-    return fallback_icons[(cl.class or ""):lower()] or "󰖟"
+local function icon_for(_cl)
+    return GENERIC_NERD_ICON
 end
 
 local function prettify_class(class)
@@ -369,16 +329,8 @@ local function tooltip_text(text)
     return clean_label(text) or "App"
 end
 
-local function tray_nerd_icon(item, entry)
-    local id = (item.id_prop or item.id or ""):lower()
-    local token = id:match("^(%w+)_status_icon") or id:match("^(%w+)%-status%-icon")
-    return fallback_icons[item.id]
-        or fallback_icons[id]
-        or (token and fallback_icons[token])
-        or fallback_icons[id:match("^(%w+)")]
-        or fallback_icons[id:match("(%w+)")]
-        or (entry and entry.nerd_icon)
-        or "󰖟"
+local function tray_nerd_icon(_item, entry)
+    return (entry and entry.nerd_icon) or GENERIC_NERD_ICON
 end
 
 local function is_tray_app(cl)
@@ -583,7 +535,7 @@ local function build_icon_widget(theme_icon, nerd_icon, cl)
         {
             markup = string.format(
                 '<span font="JetBrainsMono Nerd Font %d" foreground="%s">%s</span>',
-                ICON, c.text, nerd_icon or "󰖟"
+                ICON, c.text, nerd_icon or GENERIC_NERD_ICON
             ),
             align = "center",
             valign = "center",
